@@ -25,6 +25,7 @@ use crate::{
     util::rtt::RttDecoder,
 };
 use anyhow::{Result, anyhow};
+use probe_rs::rtos::RtosAwareness;
 use probe_rs::semihosting::SemihostingCommand;
 use probe_rs::{Architecture, BreakpointCause, BreakpointError, Error, MemoryInterface as _};
 use probe_rs::{Core, CoreStatus, HaltReason, rtt::ScanRegion};
@@ -60,6 +61,8 @@ pub struct CoreData {
     pub semihosting_handles: HashMap<u32, SemihostingFile>,
     pub repl_commands: Vec<ReplCommand>,
     pub test_data: Box<dyn Any>,
+    /// RTOS thread awareness, if detected.
+    pub rtos: Option<Box<dyn RtosAwareness>>,
 }
 
 /// File descriptor for files opened by the target.

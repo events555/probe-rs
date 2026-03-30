@@ -424,8 +424,12 @@ impl SwoAccess for BlackMagicProbeArmDebug {
 }
 
 impl SwdSequence for BlackMagicProbeArmDebug {
-    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
-        self.probe.swj_sequence(bit_len, bits)
+    fn swj_sequence(&mut self, _bit_len: u8, _bits: u64) -> Result<(), DebugProbeError> {
+        // No-op for BMP: raw SWD bit sequences conflict with the BMP firmware's
+        // internal ADIv5 state machine. The BMP's SWD init (!SS) already handles
+        // line resets, and all DP/AP access goes through the high-level remote
+        // protocol commands (!Ad, !Aa, !Am, etc.) which manage SWD internally.
+        Ok(())
     }
 
     fn swj_pins(
@@ -679,8 +683,9 @@ impl ArmMemoryInterface for BlackMagicProbeMemoryInterface<'_> {
 }
 
 impl SwdSequence for BlackMagicProbeMemoryInterface<'_> {
-    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
-        self.probe.swj_sequence(bit_len, bits)
+    fn swj_sequence(&mut self, _bit_len: u8, _bits: u64) -> Result<(), DebugProbeError> {
+        // No-op for BMP: see BlackMagicProbeArmDebug::swj_sequence
+        Ok(())
     }
 
     fn swj_pins(
@@ -694,7 +699,7 @@ impl SwdSequence for BlackMagicProbeMemoryInterface<'_> {
 }
 
 impl BlackMagicProbeMemoryInterface<'_> {
-    fn read_slice(&mut self, offset: u64, data: &mut [u8]) -> Result<(), ArmError> {
+    fn read_slice(&mut self, align: Align, offset: u64, data: &mut [u8]) -> Result<(), ArmError> {
         // When responding, the probe will prefix the response with b"&K", and will
         // suffix the response with b"#\0". Each byte is encoded as a hex pair.
         // Ensure the buffer passed to us can accommodate these extra four bytes
@@ -702,6 +707,10 @@ impl BlackMagicProbeMemoryInterface<'_> {
         if data.len() * 2 + 4 >= super::BLACK_MAGIC_REMOTE_SIZE_MAX {
             return Err(ArmError::OutOfBounds);
         }
+        // Update the CSW Size field to match the actual access width.
+        // The BMP firmware uses this to determine the AHB transfer size,
+        // and some peripherals (e.g. DBGMCU) only support word-sized access.
+        let csw = (self.csw & !0x7) | (align as u32);
         let command = match self.current_ap.ap_address().ap() {
             ApAddress::V1(_) => match self.probe.probe.remote_protocol {
                 ProtocolVersion::V0 => {
@@ -713,7 +722,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 }
                 ProtocolVersion::V0P => RemoteCommand::MemReadV0P {
                     apsel: 0,
-                    csw: self.csw,
+                    csw,
                     offset: offset
                         .try_into()
                         .map_err(|_| ArmError::AddressOutOf32BitAddressSpace)?,
@@ -722,7 +731,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 ProtocolVersion::V1 | ProtocolVersion::V2 => RemoteCommand::MemReadV1 {
                     index: self.index,
                     apsel: 0,
-                    csw: self.csw,
+                    csw,
                     offset: offset
                         .try_into()
                         .map_err(|_| ArmError::AddressOutOf32BitAddressSpace)?,
@@ -731,7 +740,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 ProtocolVersion::V3 => RemoteCommand::MemReadV3 {
                     index: self.index,
                     apsel: 0,
-                    csw: self.csw,
+                    csw,
                     offset: offset
                         .try_into()
                         .map_err(|_| ArmError::AddressOutOf32BitAddressSpace)?,
@@ -740,7 +749,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 ProtocolVersion::V4 => RemoteCommand::MemReadV4 {
                     index: self.index,
                     apsel: 0,
-                    csw: self.csw,
+                    csw,
                     offset,
                     data,
                 },
@@ -757,7 +766,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 RemoteCommand::AdiV6MemReadV4 {
                     index: self.index,
                     apsel,
-                    csw: self.csw,
+                    csw,
                     offset,
                     data,
                 }
@@ -770,10 +779,10 @@ impl BlackMagicProbeMemoryInterface<'_> {
         Ok(())
     }
 
-    fn read(&mut self, offset: u64, data: &mut [u8]) -> Result<(), ArmError> {
+    fn read(&mut self, align: Align, offset: u64, data: &mut [u8]) -> Result<(), ArmError> {
         let chunk_size = super::BLACK_MAGIC_REMOTE_SIZE_MAX / 2 - 8;
         for (chunk_index, chunk) in data.chunks_mut(chunk_size).enumerate() {
-            self.read_slice(chunk_index as u64 * chunk_size as u64 + offset, chunk)?;
+            self.read_slice(align, chunk_index as u64 * chunk_size as u64 + offset, chunk)?;
         }
         Ok(())
     }
@@ -887,19 +896,19 @@ impl MemoryInterface<ArmError> for BlackMagicProbeMemoryInterface<'_> {
     }
 
     fn read_64(&mut self, address: u64, data: &mut [u64]) -> Result<(), ArmError> {
-        self.read(address, data.as_mut_bytes())
+        self.read(Align::U64, address, data.as_mut_bytes())
     }
 
     fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), ArmError> {
-        self.read(address, data.as_mut_bytes())
+        self.read(Align::U32, address, data.as_mut_bytes())
     }
 
     fn read_16(&mut self, address: u64, data: &mut [u16]) -> Result<(), ArmError> {
-        self.read(address, data.as_mut_bytes())
+        self.read(Align::U16, address, data.as_mut_bytes())
     }
 
     fn read_8(&mut self, address: u64, data: &mut [u8]) -> Result<(), ArmError> {
-        self.read(address, data.as_mut_bytes())
+        self.read(Align::U8, address, data.as_mut_bytes())
     }
 
     fn write_64(&mut self, address: u64, data: &[u64]) -> Result<(), ArmError> {

@@ -239,6 +239,7 @@ impl SessionData {
 
                 repl_commands,
                 test_data,
+                rtos: None,
             })
         }
 
@@ -470,6 +471,14 @@ impl SessionData {
             } else if !cores_halted_previously
                 && let Some(debug_info) = target_core.core_data.debug_info.as_ref()
             {
+                // Attempt RTOS detection on first halt if not already detected.
+                if target_core.core_data.rtos.is_none() {
+                    if let Some(ref binary_path) = core_config.program_binary {
+                        target_core.core_data.rtos =
+                            try_detect_rtos(&mut target_core.core, binary_path);
+                    }
+                }
+
                 // If currently halted, and was previously running
                 // update the stack frames
                 let _stackframe_span = tracing::debug_span!("Update Stack Frames").entered();
@@ -528,4 +537,66 @@ fn debug_info_from_binary(core_configuration: &CoreConfig) -> anyhow::Result<Opt
     DebugInfo::from_file(binary_path)
         .map_err(|error| anyhow!(error))
         .map(Some)
+}
+
+/// Resolve RTOS symbol names to addresses by reading the ELF symbol table.
+fn resolve_rtos_symbols(
+    binary_path: &std::path::Path,
+    queries: &[probe_rs::rtos::SymbolQuery],
+) -> anyhow::Result<probe_rs::rtos::ResolvedSymbols> {
+    use object::{Object, ObjectSymbol};
+
+    let data = std::fs::read(binary_path)?;
+    let obj = object::File::parse(&*data)?;
+
+    let mut resolved = probe_rs::rtos::ResolvedSymbols::new();
+
+    for query in queries {
+        for sym in obj.symbols() {
+            if let Ok(name) = sym.name() {
+                if name == query.name {
+                    resolved.insert(query.name.to_string(), sym.address());
+                    break;
+                }
+            }
+        }
+        if !query.optional && !resolved.contains_key(query.name) {
+            tracing::debug!("RTOS symbol '{}' not found in ELF", query.name);
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Attempt RTOS detection for a core. Requires the core to be halted.
+pub(crate) fn try_detect_rtos(
+    core: &mut probe_rs::Core,
+    binary_path: &std::path::Path,
+) -> Option<Box<dyn probe_rs::rtos::RtosAwareness>> {
+    // Gather all symbol queries from all known backends.
+    let all_queries = vec![
+        probe_rs::rtos::SymbolQuery { name: "ch_debug", optional: false },
+        probe_rs::rtos::SymbolQuery { name: "ch", optional: true },
+        probe_rs::rtos::SymbolQuery { name: "rlist", optional: true },
+        // Future: add FreeRTOS, Zephyr symbol queries here.
+    ];
+
+    let symbols = match resolve_rtos_symbols(binary_path, &all_queries) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("Failed to resolve RTOS symbols: {e}");
+            return None;
+        }
+    };
+
+    match probe_rs::rtos::detect(core, &symbols) {
+        Some(rtos) => {
+            tracing::info!("RTOS detected, thread awareness enabled");
+            Some(rtos)
+        }
+        None => {
+            tracing::debug!("No RTOS detected");
+            None
+        }
+    }
 }

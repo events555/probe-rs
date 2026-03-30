@@ -948,12 +948,34 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
                 );
         }
 
-        // TODO: Implement actual thread resolution. For now, we just use the core id as the thread id.
-
-        let threads = vec![Thread {
-            id: target_core.id() as i64,
-            name: target_core.core_data.target_name.clone(),
-        }];
+        let threads = if let Some(rtos) = &mut target_core.core_data.rtos {
+            match rtos.threads(&mut target_core.core) {
+                Ok(rtos_threads) => rtos_threads
+                    .into_iter()
+                    .map(|t| Thread {
+                        id: t.id as i64,
+                        name: if t.is_current {
+                            format!("{} [{}] prio={} *", t.name, t.state, t.priority)
+                        } else {
+                            format!("{} [{}] prio={}", t.name, t.state, t.priority)
+                        },
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("RTOS thread enumeration failed: {e}");
+                    // Fall back to core-as-thread.
+                    vec![Thread {
+                        id: target_core.id() as i64,
+                        name: target_core.core_data.target_name.clone(),
+                    }]
+                }
+            }
+        } else {
+            vec![Thread {
+                id: target_core.id() as i64,
+                name: target_core.core_data.target_name.clone(),
+            }]
+        };
         self.send_response(request, Ok(Some(ThreadsResponseBody { threads })))
     }
 
@@ -980,8 +1002,43 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
 
         let arguments: StackTraceArguments = get_arguments(self, request)?;
 
+        // If an RTOS is active and the requested thread is not the currently
+        // running one, unwind from the saved register context instead of the
+        // live core registers.
+        let rtos_thread_frames = if let Some(rtos) = &mut target_core.core_data.rtos {
+            let requested_thread_id = arguments.thread_id as u64;
+            // Check if this thread is the currently running one.
+            let is_current = rtos
+                .threads(&mut target_core.core)
+                .ok()
+                .and_then(|threads| threads.iter().find(|t| t.id == requested_thread_id).cloned())
+                .is_some_and(|t| t.is_current);
+
+            if !is_current {
+                // Non-current thread: unwind from saved registers.
+                match Self::unwind_rtos_thread(target_core, requested_thread_id) {
+                    Ok(frames) => Some(frames),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to unwind RTOS thread {:#x}: {e}",
+                            requested_thread_id
+                        );
+                        None
+                    }
+                }
+            } else {
+                None // Current thread: use live core stack frames below.
+            }
+        } else {
+            None
+        };
+
+        let stack_frames_source = rtos_thread_frames
+            .as_deref()
+            .unwrap_or(&target_core.core_data.stack_frames);
+
         // Determine the correct 'slice' of available [StackFrame]s to serve up ...
-        let total_frames = target_core.core_data.stack_frames.len() as i64;
+        let total_frames = stack_frames_source.len() as i64;
 
         // The DAP spec says that the `levels` is optional if `None` or `Some(0)`, then all available frames should be returned.
         let mut levels = arguments.levels.unwrap_or(0);
@@ -1005,9 +1062,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
             start_frame + levels
         } as usize;
 
-        let Some(frames) = target_core
-            .core_data
-            .stack_frames
+        let Some(frames) = stack_frames_source
             .get(first_frame..last_frame)
         else {
             return self.send_response::<()>(
@@ -1074,6 +1129,66 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
             total_frames: Some(total_frames),
         };
         self.send_response(request, Ok(Some(body)))
+    }
+
+    /// Unwind the stack for a non-current RTOS thread using its saved register
+    /// context. Returns the stack frames, or an error if unwinding fails.
+    fn unwind_rtos_thread(
+        target_core: &mut CoreHandle<'_>,
+        thread_id: u64,
+    ) -> Result<Vec<probe_rs_debug::stack_frame::StackFrame>> {
+        use probe_rs::{RegisterId, RegisterValue};
+        use probe_rs_debug::{DebugRegisters, exception_handler_for_core};
+        use std::collections::HashMap;
+
+        let rtos = target_core
+            .core_data
+            .rtos
+            .as_ref()
+            .ok_or_else(|| anyhow!("No RTOS detected"))?;
+
+        let saved = rtos.thread_registers(&mut target_core.core, thread_id)?;
+
+        // Build a lookup from RegisterId -> Option<value>.
+        // Registers explicitly marked as None (not stacked) are distinguished
+        // from registers we simply don't know about.
+        let saved_map: HashMap<RegisterId, Option<u32>> = saved
+            .iter()
+            .map(|r| (r.id, r.value))
+            .collect();
+
+        let debug_info = target_core
+            .core_data
+            .debug_info
+            .as_ref()
+            .ok_or_else(|| anyhow!("No debug info loaded"))?;
+
+        // Construct DebugRegisters from the core's register definitions,
+        // providing our saved values for registers we have and None for the rest.
+        let core_regs = target_core.core.registers();
+        // For each register, check if the RTOS provided a value:
+        // - Some(Some(val)): register was saved, use the value
+        // - Some(None): register explicitly not stacked, report as unavailable
+        // - None: register not mentioned by the RTOS, treat as unavailable
+        let initial_registers =
+            DebugRegisters::from_core_registers(core_regs, |reg_id| {
+                saved_map
+                    .get(reg_id)
+                    .and_then(|opt_val| opt_val.map(RegisterValue::U32))
+            });
+
+        let exception_interface = exception_handler_for_core(target_core.core.core_type());
+        let instruction_set = target_core.core.instruction_set().ok();
+
+        let frames = debug_info.unwind(
+            &mut target_core.core,
+            initial_registers,
+            exception_interface.as_ref(),
+            instruction_set,
+            500,
+        )?;
+
+        Ok(frames)
     }
 
     /// Retrieve available scopes

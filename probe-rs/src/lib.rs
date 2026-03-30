@@ -81,6 +81,7 @@ mod memory;
 #[cfg(feature = "object")]
 pub mod meta;
 pub mod probe;
+pub mod rtos;
 pub mod rtt;
 pub mod semihosting;
 mod session;

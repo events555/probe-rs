@@ -110,7 +110,11 @@ impl DebugRegisters {
         })
     }
 
-    fn from_core_registers(
+    /// Build [`DebugRegisters`] from a [`CoreRegisters`] definition and a
+    /// closure that provides the value for each register. Used by
+    /// [`Self::from_core`], [`Self::from_coredump`], and RTOS thread awareness
+    /// (to reconstruct registers from a saved context).
+    pub fn from_core_registers(
         regs: &'static CoreRegisters,
         mut reg_value: impl FnMut(&RegisterId) -> Option<RegisterValue>,
     ) -> Self {
