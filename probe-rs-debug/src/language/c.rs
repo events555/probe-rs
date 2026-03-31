@@ -24,7 +24,9 @@ impl ProgrammingLanguage for C {
             _ if variable.memory_location == VariableLocation::Unknown => VariableValue::Empty,
 
             VariableType::Base(name) => match name.as_str() {
-                "_Bool" => UnsignedInt::get_value(variable, None, memory, variable_cache).into(),
+                "_Bool" | "bool" => {
+                    UnsignedInt::get_value(variable, None, memory, variable_cache).into()
+                }
                 "char" => CChar::get_value(variable, memory, variable_cache).into(),
 
                 "unsigned char"
@@ -91,7 +93,7 @@ impl ProgrammingLanguage for C {
     ) -> Result<(), DebugError> {
         match variable.type_name.inner() {
             VariableType::Base(name) => match name.as_str() {
-                "_Bool" => UnsignedInt::update_value(variable, None, memory, new_value),
+                "_Bool" | "bool" => UnsignedInt::update_value(variable, None, memory, new_value),
                 "char" => CChar::update_value(variable, memory, new_value),
                 "unsigned char" | "unsigned int" | "short unsigned int" | "long unsigned int" => {
                     UnsignedInt::update_value(variable, None, memory, new_value)

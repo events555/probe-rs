@@ -443,13 +443,12 @@ impl VariableLocation {
         }
     }
 
-    /// Check if the location is valid, ie. not an error, unsupported, or unavailable.
+    /// Check if the location is valid, ie. not unknown, an error, unsupported, or unavailable.
     pub fn valid(&self) -> bool {
         match self {
             VariableLocation::Address(_)
             | VariableLocation::RegisterValue(_)
-            | VariableLocation::Value
-            | VariableLocation::Unknown => true,
+            | VariableLocation::Value => true,
             _other => false,
         }
     }
@@ -638,12 +637,13 @@ impl Variable {
                 self.type_name()
             } else if let VariableLocation::Error(ref error) = self.memory_location {
                 error.clone()
+            } else if matches!(
+                self.memory_location,
+                VariableLocation::Unavailable | VariableLocation::Unsupported(_)
+            ) {
+                "<optimized away>".to_string()
             } else {
-                // This condition should only be true for intermediate nodes
-                // from DWARF. These should not show up in the final
-                // `VariableCache`. If a user sees this error, then there is
-                // a logic problem in the stack unwind
-                "Error: This is a bug! Attempted to evaluate a Variable with no type or no memory location".to_string()
+                "<location not evaluated>".to_string()
             }
         } else if matches!(self.type_name, VariableType::Struct(ref name) if name == "None") {
             "None".to_string()

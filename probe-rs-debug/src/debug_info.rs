@@ -11,10 +11,17 @@ use gimli::{
     BaseAddresses, DebugFrame, RunTimeEndian, UnwindContext, UnwindSection, UnwindTableRow,
     read::RegisterRule,
 };
-use object::read::{Object, ObjectSection};
+use object::read::{Object, ObjectSection, ObjectSymbol};
 use probe_rs::{CoreRegister, Error, InstructionSet, MemoryInterface, RegisterRole, RegisterValue};
 use std::{
-    borrow, cmp::Ordering, num::NonZeroU64, ops::ControlFlow, path::Path, rc::Rc, str::from_utf8,
+    borrow,
+    cmp::Ordering,
+    collections::HashMap,
+    num::NonZeroU64,
+    ops::ControlFlow,
+    path::Path,
+    rc::Rc,
+    str::from_utf8,
 };
 use typed_path::{TypedPath, TypedPathBuf};
 
@@ -38,6 +45,11 @@ pub struct DebugInfo {
     pub(crate) endianness: gimli::RunTimeEndian,
 
     pub(crate) addr2line: Option<addr2line::Loader>,
+
+    /// ELF symbol table: maps symbol names to addresses.
+    /// Used as a fallback to resolve declaration-only variables that have no
+    /// DWARF location attribute but do have an entry in the ELF symbol table.
+    pub(crate) symbol_table: HashMap<String, u64>,
 }
 
 impl DebugInfo {
@@ -102,6 +114,23 @@ impl DebugInfo {
             };
         }
 
+        // Extract the ELF symbol table for fallback variable resolution.
+        // This allows resolving declaration-only DWARF entries (extern variables)
+        // that have no DW_AT_location but do have an ELF symbol with an address.
+        let mut symbol_table = HashMap::new();
+        for symbol in object.symbols() {
+            if let Ok(name) = symbol.name() {
+                let addr = symbol.address();
+                if !name.is_empty() && addr != 0 && symbol.size() > 0 {
+                    symbol_table.insert(name.to_string(), addr);
+                }
+            }
+        }
+        tracing::debug!(
+            "Loaded {} symbols from ELF symbol table for fallback resolution",
+            symbol_table.len()
+        );
+
         Ok(DebugInfo {
             dwarf: dwarf_cow,
             frame_section,
@@ -111,7 +140,14 @@ impl DebugInfo {
             unit_infos,
             endianness,
             addr2line: None,
+            symbol_table,
         })
+    }
+
+    /// Look up a symbol's address in the ELF symbol table.
+    /// Used as a fallback for DWARF declaration-only variables.
+    pub(crate) fn lookup_symbol_address(&self, name: &str) -> Option<u64> {
+        self.symbol_table.get(name).copied()
     }
 
     /// Try get the [`SourceLocation`] for a given address.

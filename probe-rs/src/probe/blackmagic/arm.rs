@@ -68,7 +68,11 @@ impl BlackMagicProbeArmDebug {
             sequence,
             current_dp: None,
             dps: HashMap::new(),
-            use_overrun_detect: true,
+            // BMP firmware handles SWD transactions internally via high-level
+            // commands (!Am, !Aa, etc.). Its SWD driver does not expect overrun
+            // detection to be enabled, which can cause SWD_ACK_NO_RESPONSE errors
+            // during pipelined memory reads.
+            use_overrun_detect: false,
             accelerators,
         })
     }

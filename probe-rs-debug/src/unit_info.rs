@@ -229,6 +229,11 @@ impl UnitInfo {
 
         let abstract_entry;
 
+        // Track which UnitInfo to use for attribute processing. For same-unit
+        // references this is `self`, but for cross-unit DebugInfoRef references
+        // we need the UnitInfo that contains the referenced DIE.
+        let mut attr_unit: &UnitInfo = self;
+
         // We need to determine if we are working with a 'abstract` location, and use that node for the attributes we need
         let attributes_entry = if let Some(abstract_origin) =
             tree_node.attr(gimli::DW_AT_abstract_origin)
@@ -247,6 +252,35 @@ impl UnitInfo {
                     )?;
 
                     abstract_entry = self.unit.entry(unit_ref)?;
+
+                    Some(&abstract_entry)
+                }
+                gimli::AttributeValue::DebugInfoRef(offset) => {
+                    // Cross-unit reference: the abstract origin DIE is in a different
+                    // compilation unit. Process memory location from the current DIE first.
+                    self.process_memory_location(
+                        debug_info,
+                        tree_node,
+                        parent_variable,
+                        child_variable,
+                        memory,
+                        frame_info,
+                    )?;
+
+                    // Find the unit containing the referenced DIE.
+                    let resolved_unit = debug_info
+                        .unit_infos
+                        .iter()
+                        .find(|ui| offset.to_unit_offset(&ui.unit.header).is_some())
+                        .ok_or_else(|| {
+                            DebugError::Other(format!(
+                                "Unable to find unit for DW_AT_abstract_origin at debug info offset {:#x}",
+                                offset.0
+                            ))
+                        })?;
+                    let unit_offset = offset.to_unit_offset(&resolved_unit.unit.header).unwrap();
+                    abstract_entry = resolved_unit.unit.entry(unit_offset)?;
+                    attr_unit = resolved_unit;
 
                     Some(&abstract_entry)
                 }
@@ -270,7 +304,7 @@ impl UnitInfo {
         {
             match specification.value() {
                 gimli::AttributeValue::UnitRef(unit_ref) => {
-                    // The abstract origin is a reference to another DIE, so we need to resolve that,
+                    // The specification is a reference to another DIE, so we need to resolve that,
                     // but first we need to process the (optional) memory location using the current DIE.
                     self.process_memory_location(
                         debug_info,
@@ -282,6 +316,34 @@ impl UnitInfo {
                     )?;
 
                     specification_entry = self.unit.entry(unit_ref)?;
+                    attr_unit = self;
+
+                    Some(&specification_entry)
+                }
+                gimli::AttributeValue::DebugInfoRef(offset) => {
+                    // Cross-unit reference for DW_AT_specification.
+                    self.process_memory_location(
+                        debug_info,
+                        tree_node,
+                        parent_variable,
+                        child_variable,
+                        memory,
+                        frame_info,
+                    )?;
+
+                    let resolved_unit = debug_info
+                        .unit_infos
+                        .iter()
+                        .find(|ui| offset.to_unit_offset(&ui.unit.header).is_some())
+                        .ok_or_else(|| {
+                            DebugError::Other(format!(
+                                "Unable to find unit for DW_AT_specification at debug info offset {:#x}",
+                                offset.0
+                            ))
+                        })?;
+                    let unit_offset = offset.to_unit_offset(&resolved_unit.unit.header).unwrap();
+                    specification_entry = resolved_unit.unit.entry(unit_offset)?;
+                    attr_unit = resolved_unit;
 
                     Some(&specification_entry)
                 }
@@ -306,7 +368,7 @@ impl UnitInfo {
 
         if let Some(attributes_entry) = attributes_entry {
             child_variable.source_location =
-                self.extract_source_location(debug_info, attributes_entry)?;
+                attr_unit.extract_source_location(debug_info, attributes_entry)?;
 
             // Now loop through all the unit attributes to extract the remainder of the `Variable` definition.
             for attr in attributes_entry.attrs() {
@@ -336,7 +398,7 @@ impl UnitInfo {
                         // - The `DW_AT_location` of the child.
                         // - The `DW_AT_byte_size` of the child.
                         // - The `DW_AT_name` of the data type node.
-                        self.process_type_attribute(
+                        attr_unit.process_type_attribute(
                             attr,
                             debug_info,
                             attributes_entry,
@@ -388,10 +450,10 @@ impl UnitInfo {
                     gimli::DW_AT_discr => match attr.value() {
                         // This calculates the active discriminant value for the `VariantPart`.
                         gimli::AttributeValue::UnitRef(unit_ref) => {
-                            let discriminant_node = self.unit.entry(unit_ref)?;
+                            let discriminant_node = attr_unit.unit.entry(unit_ref)?;
                             let mut discriminant_variable =
-                                cache.create_variable(parent_variable.variable_key, Some(self))?;
-                            self.process_tree_node_attributes(
+                                cache.create_variable(parent_variable.variable_key, Some(attr_unit))?;
+                            attr_unit.process_tree_node_attributes(
                                 debug_info,
                                 &discriminant_node,
                                 parent_variable,
@@ -421,7 +483,7 @@ impl UnitInfo {
                     },
                     gimli::DW_AT_linkage_name => {
                         let value = attr.value();
-                        let raw_str = debug_info.dwarf.attr_string(&self.unit, value).ok();
+                        let raw_str = debug_info.dwarf.attr_string(&attr_unit.unit, value).ok();
 
                         let linkage_name = raw_str.and_then(|r| String::from_utf8(r.to_vec()).ok());
 
@@ -609,7 +671,8 @@ impl UnitInfo {
                     )?;
 
                     // In the case of C code, we can have entries for both the declaration and the definition of a variable.
-                    // We don't do anything with the declaration right now, so we remove it from the cache.
+                    // Declaration-only entries that couldn't be resolved via the ELF symbol table
+                    // (in process_memory_location) are discarded.
                     let is_declaration = if let Some(AttributeValue::Flag(value)) =
                         child_node.entry().attr_value(gimli::DW_AT_declaration)
                     {
@@ -618,8 +681,10 @@ impl UnitInfo {
                         false
                     };
 
-                    // Do not keep or process PhantomData nodes, or variant parts that we have already used.
-                    if is_declaration
+                    // Do not keep declarations that still have no location (truly absent),
+                    // PhantomData nodes, or variant parts that we have already used.
+                    if (is_declaration
+                        && child_variable.memory_location == VariableLocation::Unknown)
                         || child_variable.type_name.is_phantom_data()
                         || child_variable.name == VariableName::Artificial
                     {
@@ -1705,6 +1770,22 @@ impl UnitInfo {
                     child_variable.memory_location = location_from_expression;
                 }
             }
+
+            // If the location is still unknown (no DW_AT_location attribute found),
+            // try to resolve via the ELF symbol table. This handles extern variables
+            // and variables where the compiler emitted DWARF entries without location
+            // info but the linker placed the symbol at a known address.
+            if child_variable.memory_location == VariableLocation::Unknown {
+                if let VariableName::Named(ref name) = child_variable.name {
+                    if let Some(address) = debug_info.lookup_symbol_address(name) {
+                        tracing::trace!(
+                            "Resolved variable '{}' via ELF symbol table at {:#010x}",
+                            name, address
+                        );
+                        child_variable.memory_location = VariableLocation::Address(address);
+                    }
+                }
+            }
         }
 
         self.handle_memory_location_special_cases(
@@ -1989,13 +2070,56 @@ impl UnitInfo {
                 EvaluationResult::RequiresRegister {
                     register,
                     base_type,
-                } => provide_register(frame_info.registers, register, base_type, &mut evaluation)?,
+                } => provide_register(&self.unit, frame_info.registers, register, base_type, &mut evaluation)?,
                 EvaluationResult::RequiresRelocatedAddress(address_index) => {
                     // The address_index as an offset from 0, so just pass it into the next step.
                     evaluation.resume_with_relocated_address(address_index)?
                 }
                 EvaluationResult::RequiresCallFrameCfa => {
                     provide_cfa(frame_info.canonical_frame_address, &mut evaluation)?
+                }
+                EvaluationResult::RequiresBaseType(unit_offset) => {
+                    provide_base_type(&self.unit, unit_offset, &mut evaluation)?
+                }
+                EvaluationResult::RequiresEntryValue(entry_expression) => {
+                    // DW_OP_entry_value / DW_OP_GNU_entry_value: evaluate the
+                    // sub-expression using the same frame info (registers at entry).
+                    let pieces = self.expression_to_piece(memory, entry_expression, frame_info)?;
+                    let value = if let Some(piece) = pieces.first() {
+                        match &piece.location {
+                            Location::Register { register } => {
+                                match frame_info
+                                    .registers
+                                    .get_register_by_dwarf_id(register.0)
+                                    .and_then(|r| r.value)
+                                {
+                                    Some(v) => gimli::Value::Generic(v.try_into()?),
+                                    None => {
+                                        return Err(DebugError::WarnAndContinue {
+                                            message: format!(
+                                                "Entry value: register {} unavailable",
+                                                register.0
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            Location::Address { address } => {
+                                gimli::Value::Generic(*address)
+                            }
+                            Location::Value { value } => *value,
+                            _ => {
+                                return Err(DebugError::WarnAndContinue {
+                                    message: "Entry value: unsupported location type".to_string(),
+                                });
+                            }
+                        }
+                    } else {
+                        return Err(DebugError::WarnAndContinue {
+                            message: "Entry value: expression produced no result".to_string(),
+                        });
+                    };
+                    evaluation.resume_with_entry_value(value)?
                 }
                 unimplemented_expression => {
                     return Err(DebugError::WarnAndContinue {
@@ -2339,29 +2463,69 @@ fn extract_name(
 
 /// Gets necessary register information for the DWARF resolver.
 fn provide_register(
+    unit: &gimli::Unit<GimliReader, usize>,
     stack_frame_registers: &DebugRegisters,
     register: gimli::Register,
     base_type: UnitOffset,
     evaluation: &mut gimli::Evaluation<EndianReader>,
 ) -> Result<EvaluationResult<EndianReader>, DebugError> {
-    match stack_frame_registers
+    let Some(raw_value) = stack_frame_registers
         .get_register_by_dwarf_id(register.0)
         .and_then(|reg| reg.value)
-    {
-        Some(raw_value) if base_type == gimli::UnitOffset(0) => {
-            let register_value = gimli::Value::Generic(raw_value.try_into()?);
-            Ok(evaluation.resume_with_register(register_value)?)
-        }
-        Some(_) => Err(DebugError::WarnAndContinue {
-            message: format!("Unimplemented: Support for type {base_type:?} in `RequiresRegister`"),
-        }),
-        None => Err(DebugError::WarnAndContinue {
+    else {
+        return Err(DebugError::WarnAndContinue {
             message: format!(
                 "Error while calculating `Variable::memory_location`. No value for register #:{}.",
                 register.0
             ),
-        }),
+        });
+    };
+
+    let raw_u64: u64 = raw_value.try_into()?;
+
+    let register_value = if base_type == gimli::UnitOffset(0) {
+        gimli::Value::Generic(raw_u64)
+    } else {
+        // Resolve the base type DIE to determine how to interpret the register value.
+        let value_type = resolve_base_type(unit, base_type)?;
+        match value_type {
+            gimli::ValueType::Generic => gimli::Value::Generic(raw_u64),
+            gimli::ValueType::I8 => gimli::Value::I8(raw_u64 as i8),
+            gimli::ValueType::U8 => gimli::Value::U8(raw_u64 as u8),
+            gimli::ValueType::I16 => gimli::Value::I16(raw_u64 as i16),
+            gimli::ValueType::U16 => gimli::Value::U16(raw_u64 as u16),
+            gimli::ValueType::I32 => gimli::Value::I32(raw_u64 as i32),
+            gimli::ValueType::U32 => gimli::Value::U32(raw_u64 as u32),
+            gimli::ValueType::I64 => gimli::Value::I64(raw_u64 as i64),
+            gimli::ValueType::U64 => gimli::Value::U64(raw_u64),
+            gimli::ValueType::F32 => gimli::Value::F32(f32::from_bits(raw_u64 as u32)),
+            gimli::ValueType::F64 => gimli::Value::F64(f64::from_bits(raw_u64)),
+        }
+    };
+
+    Ok(evaluation.resume_with_register(register_value)?)
+}
+
+/// Resolves a DWARF base type DIE offset to a `ValueType`.
+fn resolve_base_type(
+    unit: &gimli::Unit<GimliReader, usize>,
+    unit_offset: UnitOffset,
+) -> Result<gimli::ValueType, DebugError> {
+    if unit_offset == UnitOffset(0) {
+        return Ok(gimli::ValueType::Generic);
     }
+
+    let entry = unit.entry(unit_offset).map_err(|e| DebugError::WarnAndContinue {
+        message: format!("Failed to read base type DIE at {unit_offset:?}: {e}"),
+    })?;
+
+    let value_type = gimli::ValueType::from_entry(&entry)
+        .map_err(|e| DebugError::WarnAndContinue {
+            message: format!("Failed to parse base type at {unit_offset:?}: {e}"),
+        })?
+        .unwrap_or(gimli::ValueType::Generic);
+
+    Ok(value_type)
 }
 
 /// Gets necessary framebase information for the DWARF resolver.
@@ -2446,6 +2610,16 @@ fn read_memory(
     };
 
     Ok(evaluation.resume_with_memory(val)?)
+}
+
+/// Resolves a base type DIE to a `ValueType` for DW_OP_convert / DW_OP_GNU_convert.
+fn provide_base_type(
+    unit: &gimli::Unit<GimliReader, usize>,
+    unit_offset: UnitOffset,
+    evaluation: &mut gimli::Evaluation<EndianReader>,
+) -> Result<EvaluationResult<EndianReader>, DebugError> {
+    let value_type = resolve_base_type(unit, unit_offset)?;
+    Ok(evaluation.resume_with_base_type(value_type)?)
 }
 
 pub(crate) trait RangeExt {
