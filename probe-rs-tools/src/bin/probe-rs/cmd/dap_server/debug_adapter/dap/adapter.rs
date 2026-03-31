@@ -120,12 +120,16 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
     ) -> Result<()> {
         let arguments: DisconnectArguments = get_arguments(self, request)?;
 
-        // TODO: For now (until we do multicore), we will assume that both terminate and suspend translate to a halt of the core.
         let must_halt_debuggee = arguments.terminate_debuggee.unwrap_or(false)
             || arguments.suspend_debuggee.unwrap_or(false);
 
         if must_halt_debuggee {
             let _ = target_core.core.halt(Duration::from_millis(100));
+        } else {
+            // Resume the core so the target continues running after the debug
+            // session ends. Without this, the core stays halted and RTOS
+            // timers/watchdogs will fault on the next attach.
+            let _ = target_core.core.run();
         }
 
         self.send_response::<DisconnectResponse>(request, Ok(None))
