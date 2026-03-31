@@ -22,7 +22,11 @@
 //! Each thread's `port_context.sp` points to a `port_intctx` on its stack.
 //! Without FPU: `{r4-r11, lr}` (9 words, 0x24 bytes).
 //! With FPU:    `{s16-s31, r4-r11, lr}` (25 words, 0x64 bytes).
-//! We detect FPU at runtime by reading the CPACR register.
+//!
+//! If the saved LR is an EXC_RETURN value (bits [31:4] = 0xFFFFFFF), the
+//! thread was preempted by an interrupt and a hardware exception frame sits
+//! above the software frame. We parse that frame to recover the real PC,
+//! caller-saved registers, and reconstruct the correct SP.
 
 use super::{read_cstring, ResolvedSymbols, RtosAwareness, RtosThread, SavedRegister, SymbolQuery};
 use crate::{Core, Error, RegisterId};
@@ -36,6 +40,8 @@ const CPACR_ADDR: u64 = 0xE000_ED88;
 const CHDEBUG_MIN_SIZE: usize = 43;
 
 /// Thread state names, indexed by the `state` byte in the thread struct.
+/// This table matches ChibiOS/RT 3.x through 6.x. Older (2.x) or future
+/// versions may use different indices; out-of-range values display as "state=N".
 const THREAD_STATES: &[&str] = &[
     "Ready",
     "Current",
@@ -170,40 +176,53 @@ impl ChibiDebugSignature {
     }
 }
 
-/// Whether the Cortex-M FPU is enabled, which changes the context frame size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FpuState {
-    Disabled,
-    Enabled,
+/// Software context frame layout, which determines how to find callee-saved
+/// registers on the thread's stack.
+#[derive(Debug, Clone, Copy)]
+struct SwFrameLayout {
+    /// Total size in bytes of the software-saved context frame (`port_intctx`).
+    size: u64,
+    /// Byte offset from `sp` to the first general-purpose register (r4).
+    gpr_offset: u64,
 }
 
-impl FpuState {
-    /// Check the CPACR register to see if CP10/CP11 have full access.
-    fn detect(core: &mut Core) -> Result<Self, Error> {
+/// Known frame layouts for Cortex-M.
+const SW_FRAME_NO_FPU: SwFrameLayout = SwFrameLayout {
+    size: 0x24,       // r4-r11, lr = 9 * 4
+    gpr_offset: 0x00,
+};
+
+const SW_FRAME_WITH_FPU: SwFrameLayout = SwFrameLayout {
+    size: 0x64,       // s16-s31 (16) + r4-r11, lr (9) = 25 * 4
+    gpr_offset: 0x40, // skip 16 FPU regs
+};
+
+impl SwFrameLayout {
+    /// Determine the software frame layout.
+    ///
+    /// Prefers the `intctx_size` field from the ChibiOS debug signature (which
+    /// reflects the firmware's compile-time FPU configuration) over reading the
+    /// hardware CPACR register (which only tells us if the hardware *has* an FPU,
+    /// not whether the firmware uses it).
+    fn detect(core: &mut Core, sig: &ChibiDebugSignature) -> Result<Self, Error> {
+        if sig.intctx_size > 0 {
+            // The signature tells us the exact size of port_intctx.
+            let size = sig.intctx_size as u64;
+            let gpr_offset = if size > SW_FRAME_NO_FPU.size {
+                // FPU regs are at the start; GPRs follow.
+                size - SW_FRAME_NO_FPU.size
+            } else {
+                0
+            };
+            return Ok(Self { size, gpr_offset });
+        }
+
+        // Fallback for older signatures without intctx_size: read CPACR.
         let cpacr = core.read_word_32(CPACR_ADDR)?;
         if cpacr & 0x00F0_0000 != 0 {
-            Ok(FpuState::Enabled)
+            Ok(SW_FRAME_WITH_FPU)
         } else {
-            Ok(FpuState::Disabled)
-        }
-    }
-
-    /// Size in bytes of the software-saved context frame (`port_intctx`).
-    fn sw_frame_size(self) -> u64 {
-        match self {
-            // r4-r11, lr = 9 registers * 4 bytes
-            FpuState::Disabled => 0x24,
-            // s16-s31 (16 regs) + r4-r11, lr (9 regs) = 25 * 4 bytes
-            FpuState::Enabled => 0x64,
-        }
-    }
-
-    /// Byte offset from `sp` to the first general-purpose register (r4).
-    fn gpr_offset(self) -> u64 {
-        match self {
-            FpuState::Disabled => 0x00,
-            // Skip the 16 FPU registers (s16-s31)
-            FpuState::Enabled => 0x40,
+            Ok(SW_FRAME_NO_FPU)
         }
     }
 }
@@ -223,7 +242,7 @@ struct InstanceInfo {
 pub struct ChibiOsAwareness {
     sig: ChibiDebugSignature,
     instances: Vec<InstanceInfo>,
-    fpu: FpuState,
+    sw_frame: SwFrameLayout,
     /// Thread ID of the currently running thread (updated on each `threads()` call).
     /// Used to reject `thread_registers()` for the running thread, which has no
     /// valid saved context.
@@ -332,12 +351,12 @@ impl ChibiOsAwareness {
             }
         };
 
-        let fpu = FpuState::detect(core).ok()?;
+        let sw_frame = SwFrameLayout::detect(core, &sig).ok()?;
 
         Some(Box::new(Self {
             sig,
             instances,
-            fpu,
+            sw_frame,
             current_thread_id: None,
         }))
     }
@@ -383,7 +402,7 @@ impl RtosAwareness for ChibiOsAwareness {
 
             // Validate list integrity in first pass.
             let mut prev = reglist;
-            let start_addr = addr;
+            let _start_addr = addr;
             loop {
                 if addr == 0 {
                     return Err(Error::Other(
@@ -395,7 +414,10 @@ impl RtosAwareness for ChibiOsAwareness {
                 }
 
                 // Integrity: check backward pointer matches where we came from.
-                let older = core.read_word_32(addr + 4)? as u64; // second pointer in queue node
+                // The queue node's backward pointer is at (off_older - off_newer) from the
+                // forward pointer, since the node is embedded at off_newer within thread_t.
+                let back_ptr_offset = (sig.off_older - sig.off_newer) as u64;
+                let older = core.read_word_32(addr + back_ptr_offset)? as u64;
                 if older != prev {
                     tracing::warn!(
                         "ChibiOS registry: backward pointer mismatch \
@@ -434,10 +456,12 @@ impl RtosAwareness for ChibiOsAwareness {
                 let state_byte = core.read_word_8(thread_base + sig.off_state as u64)?;
                 let state = THREAD_STATES
                     .get(state_byte as usize)
-                    .unwrap_or(&"Unknown")
-                    .to_string();
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("state={state_byte}"));
 
-                let priority = core.read_word_8(thread_base + sig.off_prio as u64)?;
+                // ChibiOS tprio_t is typically u32. Read full word for endianness
+                // correctness, then truncate to u8 for display.
+                let priority = core.read_word_32(thread_base + sig.off_prio as u64)? as u8;
 
                 let is_current = thread_base == current_thread;
                 if is_current {
@@ -469,27 +493,22 @@ impl RtosAwareness for ChibiOsAwareness {
         core: &mut Core,
         thread_id: u64,
     ) -> Result<Vec<SavedRegister>, Error> {
+        // Guard: the current thread's saved context is stale — the caller
+        // should read registers directly from the core instead.
+        if self.current_thread_id == Some(thread_id) {
+            return Err(Error::Other(
+                "Cannot read saved registers for the currently running thread; \
+                 use live core registers instead"
+                    .to_string(),
+            ));
+        }
+
         // Read the saved stack pointer from the thread's port_context.
         let sp = core.read_word_32(thread_id + self.sig.off_ctx as u64)? as u64;
 
-        let gpr_base = sp + self.fpu.gpr_offset();
+        let gpr_base = sp + self.sw_frame.gpr_offset;
 
-        // Cortex-M register map. ChibiOS only saves callee-saved registers
-        // (r4-r11) and LR during context switch. The caller-saved registers
-        // (r0-r3, r12) and xpsr are NOT part of the software context frame —
-        // they are only in the hardware exception frame for interrupted threads.
-        // We explicitly mark them as unavailable.
-        let mut regs = vec![
-            // Caller-saved: not stacked by ChibiOS context switch.
-            SavedRegister { id: RegisterId(0),  value: None }, // r0
-            SavedRegister { id: RegisterId(1),  value: None }, // r1
-            SavedRegister { id: RegisterId(2),  value: None }, // r2
-            SavedRegister { id: RegisterId(3),  value: None }, // r3
-            SavedRegister { id: RegisterId(12), value: None }, // r12
-            SavedRegister { id: RegisterId(16), value: None }, // xpsr
-        ];
-
-        // Callee-saved: read from the software context frame.
+        // Callee-saved registers from the software context frame.
         const SW_REGS: &[(u16, u64)] = &[
             (4, 0x00),  // r4
             (5, 0x04),  // r5
@@ -499,8 +518,9 @@ impl RtosAwareness for ChibiOsAwareness {
             (9, 0x14),  // r9
             (10, 0x18), // r10
             (11, 0x1C), // r11
-            (14, 0x20), // lr
         ];
+
+        let mut regs = Vec::with_capacity(17);
 
         for &(reg_num, offset) in SW_REGS {
             let val = core.read_word_32(gpr_base + offset)?;
@@ -510,20 +530,89 @@ impl RtosAwareness for ChibiOsAwareness {
             });
         }
 
-        // The saved LR from the context switch is the return address — where
-        // the thread will resume. Report it as PC.
-        let lr = core.read_word_32(gpr_base + 0x20)?;
-        regs.push(SavedRegister {
-            id: RegisterId(15), // PC
-            value: Some(lr),
-        });
+        // The saved LR from the context switch.
+        let saved_lr = core.read_word_32(gpr_base + 0x20)?;
 
-        // Reconstruct SP: it pointed to the bottom of the SW frame.
-        let reconstructed_sp = sp + self.fpu.sw_frame_size();
-        regs.push(SavedRegister {
-            id: RegisterId(13), // SP
-            value: Some(reconstructed_sp as u32),
-        });
+        // Check if the saved LR is an EXC_RETURN value (Cortex-M exception
+        // return magic). This means the thread was preempted by an interrupt,
+        // and the hardware exception frame sits above the software frame on
+        // the stack. EXC_RETURN values have bits [31:4] set to 0xFFFFFFF.
+        let is_exc_return = saved_lr & 0xFFFF_FFF0 == 0xFFFF_FFF0;
+
+        if is_exc_return {
+            // The hardware exception frame is above the software frame:
+            //   [sw_frame | hw_exception_frame | ... rest of stack]
+            //   ^sp       ^hw_base
+            //
+            // The hw frame layout (without FPU stacking):
+            //   +0x00: R0
+            //   +0x04: R1
+            //   +0x08: R2
+            //   +0x0C: R3
+            //   +0x10: R12
+            //   +0x14: LR (the real return address)
+            //   +0x18: PC (the real PC where the thread was interrupted)
+            //   +0x1C: xPSR
+            //   (if FPU stacking: +0x20..+0x60: S0-S15, FPSCR, reserved)
+            //
+            // EXC_RETURN bit 4: 0 = FPU context stacked, 1 = no FPU stacking.
+            let hw_fpu_stacked = saved_lr & (1 << 4) == 0;
+            let hw_frame_size: u64 = if hw_fpu_stacked {
+                0x68 // 26 words: 8 standard + 18 FPU (S0-S15, FPSCR, reserved)
+            } else {
+                0x20 // 8 words: R0, R1, R2, R3, R12, LR, PC, xPSR
+            };
+
+            let hw_base = sp + self.sw_frame.size;
+
+            // Read the real register values from the hardware exception frame.
+            let hw_r0 = core.read_word_32(hw_base)?;
+            let hw_r1 = core.read_word_32(hw_base + 0x04)?;
+            let hw_r2 = core.read_word_32(hw_base + 0x08)?;
+            let hw_r3 = core.read_word_32(hw_base + 0x0C)?;
+            let hw_r12 = core.read_word_32(hw_base + 0x10)?;
+            let hw_lr = core.read_word_32(hw_base + 0x14)?;
+            let hw_pc = core.read_word_32(hw_base + 0x18)?;
+            let hw_xpsr = core.read_word_32(hw_base + 0x1C)?;
+
+            regs.push(SavedRegister { id: RegisterId(0),  value: Some(hw_r0) });
+            regs.push(SavedRegister { id: RegisterId(1),  value: Some(hw_r1) });
+            regs.push(SavedRegister { id: RegisterId(2),  value: Some(hw_r2) });
+            regs.push(SavedRegister { id: RegisterId(3),  value: Some(hw_r3) });
+            regs.push(SavedRegister { id: RegisterId(12), value: Some(hw_r12) });
+            regs.push(SavedRegister { id: RegisterId(14), value: Some(hw_lr) });
+            regs.push(SavedRegister { id: RegisterId(15), value: Some(hw_pc) });
+            regs.push(SavedRegister { id: RegisterId(16), value: Some(hw_xpsr) });
+
+            // SP reconstruction: skip SW frame + HW exception frame.
+            // Also account for xPSR bit 9 (stack was 8-byte aligned on exception entry).
+            let align_adjust = if hw_xpsr & (1 << 9) != 0 { 4u64 } else { 0 };
+            let reconstructed_sp = hw_base + hw_frame_size + align_adjust;
+            regs.push(SavedRegister {
+                id: RegisterId(13),
+                value: Some(reconstructed_sp as u32),
+            });
+        } else {
+            // Voluntarily-switched thread: the saved LR is a real code address
+            // where the thread will resume. Report it as both LR and PC.
+            regs.push(SavedRegister { id: RegisterId(14), value: Some(saved_lr) }); // LR
+            regs.push(SavedRegister { id: RegisterId(15), value: Some(saved_lr) }); // PC
+
+            // Caller-saved registers are not part of the voluntary context switch.
+            regs.push(SavedRegister { id: RegisterId(0),  value: None }); // r0
+            regs.push(SavedRegister { id: RegisterId(1),  value: None }); // r1
+            regs.push(SavedRegister { id: RegisterId(2),  value: None }); // r2
+            regs.push(SavedRegister { id: RegisterId(3),  value: None }); // r3
+            regs.push(SavedRegister { id: RegisterId(12), value: None }); // r12
+            regs.push(SavedRegister { id: RegisterId(16), value: None }); // xpsr
+
+            // SP reconstruction: skip only the software frame.
+            let reconstructed_sp = sp + self.sw_frame.size;
+            regs.push(SavedRegister {
+                id: RegisterId(13),
+                value: Some(reconstructed_sp as u32),
+            });
+        }
 
         Ok(regs)
     }
