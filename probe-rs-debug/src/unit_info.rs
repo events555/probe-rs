@@ -745,13 +745,38 @@ impl UnitInfo {
                         }
                     }
 
+                    // DWARF deduplication: when multiple CUs emit entries for the
+                    // same variable (e.g., extern declarations from headers), prefer
+                    // the entry with a resolved location/value and drop the rest.
+                    // This matches GDB's behavior (DWARF5 §2.13.2) of treating
+                    // declaration-only entries as LOC_UNRESOLVED and preferring
+                    // definitions at lookup time.
+                    if matches!(child_variable.name, VariableName::Named(_))
+                        && cache.deduplicate_by_name(&child_variable)?
+                    {
+                        continue;
+                    }
+
+                    // DW_AT_specification entries that have no location or value are
+                    // "definitions" that completed nothing — e.g., orphaned C++ static
+                    // constexpr members. Per DWARF spec, these should carry the value
+                    // but the compiler didn't emit one.
+                    let has_specification = child_node
+                        .entry()
+                        .attr_value(gimli::DW_AT_specification)
+                        .is_some();
+
                     // Do not keep:
                     // - Declarations that still have no location and no value (truly absent)
+                    // - Specification entries that completed nothing (no value/location)
                     // - Unnamed variables with unknown type (DWARF intermediate nodes)
                     // - PhantomData nodes or variant parts already used
                     if (is_declaration
                         && child_variable.memory_location == VariableLocation::Unknown
                         && child_variable.value.is_empty())
+                        || (has_specification
+                            && child_variable.memory_location == VariableLocation::Unknown
+                            && child_variable.value.is_empty())
                         || (child_variable.name == VariableName::Unknown
                             && child_variable.type_name == VariableType::Unknown)
                         || child_variable.type_name.is_phantom_data()

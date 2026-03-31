@@ -351,6 +351,51 @@ impl VariableCache {
             .filter(move |child_variable| child_variable.parent_key == parent_key)
     }
 
+    /// DWARF deduplication: when a resolved entry exists for a given name
+    /// under the same parent, remove any unresolved siblings with the same name.
+    /// Returns `true` if the given variable was itself removed (caller should skip it).
+    pub fn deduplicate_by_name(
+        &mut self,
+        variable: &Variable,
+    ) -> Result<bool, Error> {
+        let is_resolved = |v: &Variable| v.memory_location.valid() || !v.value.is_empty();
+
+        let self_resolved = is_resolved(variable);
+
+        // Find sibling keys with the same name, excluding self.
+        let siblings: Vec<_> = self
+            .variable_hash_map
+            .values()
+            .filter(|v| {
+                v.name == variable.name
+                    && v.parent_key == variable.parent_key
+                    && v.variable_key != variable.variable_key
+            })
+            .map(|v| (v.variable_key, is_resolved(v)))
+            .collect();
+
+        if siblings.is_empty() {
+            return Ok(false);
+        }
+
+        let any_sibling_resolved = siblings.iter().any(|(_, resolved)| *resolved);
+
+        if any_sibling_resolved && !self_resolved {
+            // A sibling already has a value — this entry is redundant.
+            self.remove_cache_entry(variable.variable_key)?;
+            return Ok(true);
+        }
+
+        if self_resolved && !any_sibling_resolved {
+            // This entry has a value but siblings don't — remove them.
+            for (key, _) in siblings {
+                self.remove_cache_entry(key)?;
+            }
+        }
+
+        Ok(false)
+    }
+
     /// Check if variable has children. If the variable doesn't exist, it will return false.
     pub fn has_children(&self, parent_variable: &Variable) -> bool {
         self.get_children(parent_variable.variable_key)
