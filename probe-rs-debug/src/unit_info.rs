@@ -1701,11 +1701,12 @@ impl UnitInfo {
         frame_info: StackFrameInfo<'_>,
     ) -> Result<(), DebugError> {
         let Some((current_range, remaining_ranges)) = subranges.split_first() else {
-            array_variable.set_value(VariableValue::Error(
-                "Error processing range for array, unexpected empty range. \
-                    This is a known issue, see https://github.com/probe-rs/probe-rs/issues/2687"
-                    .to_string(),
-            ));
+            // No subrange information available. For variables with a known
+            // address (e.g., linker boundary symbols), display the address
+            // rather than showing an error.
+            if let Ok(addr) = array_variable.memory_location.memory_address() {
+                array_variable.set_value(VariableValue::Valid(format!("{:#010X}", addr)));
+            }
             return Ok(());
         };
 
