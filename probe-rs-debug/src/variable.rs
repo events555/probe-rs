@@ -652,7 +652,7 @@ impl Variable {
             ) {
                 "<optimized away>".to_string()
             } else {
-                "<location not evaluated>".to_string()
+                "<optimized out>".to_string()
             }
         } else if matches!(self.type_name, VariableType::Struct(ref name) if name == "None") {
             "None".to_string()
