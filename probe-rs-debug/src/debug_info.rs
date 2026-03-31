@@ -119,13 +119,24 @@ impl DebugInfo {
         // that have no DW_AT_location but do have an ELF symbol with an address.
         // For C++ symbols, we also store the demangled name as a key so that
         // DWARF entries using unmangled names can be matched.
-        let mut symbol_table = HashMap::new();
+        let mut symbol_table: HashMap<String, u64> = HashMap::new();
+        // Track names that map to multiple different addresses so we can
+        // remove them — an ambiguous symbol is worse than no symbol.
+        let mut ambiguous_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for symbol in object.symbols() {
             if let Ok(name) = symbol.name() {
                 let addr = symbol.address();
                 if !name.is_empty() && addr != 0 && symbol.size() > 0 {
-                    // Store under the raw (possibly mangled) name.
-                    symbol_table.insert(name.to_string(), addr);
+                    let name_str = name.to_string();
+
+                    // Insert or detect collision for the raw (possibly mangled) name.
+                    Self::insert_or_mark_ambiguous(
+                        &mut symbol_table,
+                        &mut ambiguous_names,
+                        name_str.clone(),
+                        addr,
+                    );
 
                     // Also store under the demangled name if it differs.
                     let demangled = addr2line::demangle_auto(
@@ -133,10 +144,25 @@ impl DebugInfo {
                         None,
                     );
                     if demangled != name {
-                        symbol_table.insert(demangled.into_owned(), addr);
+                        Self::insert_or_mark_ambiguous(
+                            &mut symbol_table,
+                            &mut ambiguous_names,
+                            demangled.into_owned(),
+                            addr,
+                        );
                     }
                 }
             }
+        }
+        // Remove ambiguous entries — better to have no fallback than a wrong one.
+        for name in &ambiguous_names {
+            symbol_table.remove(name);
+        }
+        if !ambiguous_names.is_empty() {
+            tracing::debug!(
+                "Removed {} ambiguous symbol names from fallback table",
+                ambiguous_names.len()
+            );
         }
         tracing::debug!(
             "Loaded {} symbol table entries (with demangled aliases) for fallback resolution",
@@ -154,6 +180,26 @@ impl DebugInfo {
             addr2line: None,
             symbol_table,
         })
+    }
+
+    /// Insert a symbol name→address mapping, or mark it as ambiguous if the
+    /// name already maps to a *different* address.
+    fn insert_or_mark_ambiguous(
+        table: &mut HashMap<String, u64>,
+        ambiguous: &mut std::collections::HashSet<String>,
+        name: String,
+        addr: u64,
+    ) {
+        match table.entry(name) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(addr);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                if *e.get() != addr {
+                    ambiguous.insert(e.key().clone());
+                }
+            }
+        }
     }
 
     /// Look up a symbol's address in the ELF symbol table.
