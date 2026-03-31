@@ -1606,17 +1606,49 @@ impl UnitInfo {
         }
 
         let value = if let VariableLocation::Address(address) = child_variable.memory_location {
-            // NOTE: hard-coding value of variable.byte_size to 1 ... replace with code if necessary.
-            let mut buff = 0u8;
-            memory.read(address, std::slice::from_mut(&mut buff))?;
-            let this_enum_const_value = buff.to_string();
+            // Read the enum value using its actual byte size from DWARF.
+            let byte_size = child_variable
+                .byte_size
+                .or_else(|| extract_byte_size(node))
+                .unwrap_or(4) as usize;
+            let is_signed = matches!(
+                node.attr_value(gimli::DW_AT_encoding),
+                Some(AttributeValue::Encoding(gimli::DW_ATE_signed | gimli::DW_ATE_signed_char))
+            );
+
+            let mut buf = [0u8; 8];
+            let read_size = byte_size.min(8);
+            memory.read(address, &mut buf[..read_size])?;
+
+            let this_enum_const_value = if is_signed {
+                // Sign-extend to i64 for comparison with signed DW_AT_const_value.
+                let raw = i64::from_le_bytes({
+                    let mut ext = [0u8; 8];
+                    ext[..read_size].copy_from_slice(&buf[..read_size]);
+                    // Sign-extend: if MSB is set, fill upper bytes with 0xFF.
+                    if read_size < 8 && buf[read_size - 1] & 0x80 != 0 {
+                        ext[read_size..].fill(0xFF);
+                    }
+                    ext
+                });
+                raw.to_string()
+            } else {
+                let raw = u64::from_le_bytes({
+                    let mut ext = [0u8; 8];
+                    ext[..read_size].copy_from_slice(&buf[..read_size]);
+                    ext
+                });
+                raw.to_string()
+            };
 
             let enumerator_value = match enumerator_values
                 .iter()
                 .find(|(_name, value)| value.to_string() == this_enum_const_value)
             {
                 Some((name, _value)) => name,
-                None => &VariableName::Named("<Error: Unresolved enum value>".to_string()),
+                None => &VariableName::Named(format!(
+                    "<Error: Unresolved enum value {this_enum_const_value}>"
+                )),
             };
 
             self.language

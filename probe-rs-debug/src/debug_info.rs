@@ -128,7 +128,7 @@ impl DebugInfo {
             if let Ok(name) = symbol.name() {
                 let addr = symbol.address();
                 let size = symbol.size();
-                if !name.is_empty() && addr != 0 && size > 0 {
+                if !name.is_empty() && addr != 0 {
                     let name_str = name.to_string();
                     let entry = (addr, size);
 
