@@ -708,8 +708,11 @@ impl UnitInfo {
 
                     // Static members (DW_AT_declaration) don't have instance storage.
                     // The type resolution path may have incorrectly inherited the
-                    // parent struct's address. Reset it.
+                    // parent struct's address. Reset it — but only if the address
+                    // matches the parent's (inherited), not if it was independently
+                    // resolved (e.g. via ELF symbol table in process_memory_location).
                     if is_declaration
+                        && child_variable.memory_location == parent_variable.memory_location
                         && !matches!(
                             child_variable.memory_location,
                             VariableLocation::Value | VariableLocation::Unknown
@@ -2155,45 +2158,17 @@ impl UnitInfo {
                 EvaluationResult::RequiresBaseType(unit_offset) => {
                     provide_base_type(&self.unit, unit_offset, &mut evaluation)?
                 }
-                EvaluationResult::RequiresEntryValue(entry_expression) => {
-                    // DW_OP_entry_value / DW_OP_GNU_entry_value: evaluate the
-                    // sub-expression using the same frame info (registers at entry).
-                    let pieces = self.expression_to_piece(memory, entry_expression, frame_info)?;
-                    let value = if let Some(piece) = pieces.first() {
-                        match &piece.location {
-                            Location::Register { register } => {
-                                match frame_info
-                                    .registers
-                                    .get_register_by_dwarf_id(register.0)
-                                    .and_then(|r| r.value)
-                                {
-                                    Some(v) => gimli::Value::Generic(v.try_into()?),
-                                    None => {
-                                        return Err(DebugError::WarnAndContinue {
-                                            message: format!(
-                                                "Entry value: register {} unavailable",
-                                                register.0
-                                            ),
-                                        });
-                                    }
-                                }
-                            }
-                            Location::Address { address } => {
-                                gimli::Value::Generic(*address)
-                            }
-                            Location::Value { value } => *value,
-                            _ => {
-                                return Err(DebugError::WarnAndContinue {
-                                    message: "Entry value: unsupported location type".to_string(),
-                                });
-                            }
-                        }
-                    } else {
-                        return Err(DebugError::WarnAndContinue {
-                            message: "Entry value: expression produced no result".to_string(),
-                        });
-                    };
-                    evaluation.resume_with_entry_value(value)?
+                EvaluationResult::RequiresEntryValue(_entry_expression) => {
+                    // DW_OP_entry_value / DW_OP_GNU_entry_value requires the
+                    // register values at function entry, not the current frame's
+                    // values. We don't have access to entry-point registers, so
+                    // return an error rather than silently using current values
+                    // (which would produce incorrect results for optimized code).
+                    return Err(DebugError::WarnAndContinue {
+                        message: "DW_OP_entry_value not supported: requires function \
+                                  entry-point registers which are not available"
+                            .to_string(),
+                    });
                 }
                 unimplemented_expression => {
                     return Err(DebugError::WarnAndContinue {
@@ -2212,6 +2187,17 @@ impl UnitInfo {
     /// Try to resolve a `static constexpr` member's value from the parent struct's
     /// template value parameters. Matches by comparing the member's type DIE offset
     /// against template parameter type DIE offsets.
+    /// Extract a string from a DWARF attribute value (inline strings only).
+    /// Returns `None` for `DebugStrRef` (which requires DebugInfo access) —
+    /// callers should treat this as "name unavailable" and fall back to
+    /// conservative behavior.
+    fn attribute_to_string(&self, value: AttributeValue<GimliReader>) -> Option<String> {
+        match value {
+            AttributeValue::String(s) => Some(String::from_utf8_lossy(&s).into_owned()),
+            _ => None,
+        }
+    }
+
     /// Unwrap const/volatile type modifiers to get the underlying base type offset.
     fn unwrap_type_modifiers(&self, mut offset: UnitOffset) -> UnitOffset {
         for _ in 0..10 {
@@ -2243,6 +2229,12 @@ impl UnitInfo {
             _ => return None,
         };
 
+        // Get the member's name for disambiguation when multiple template params
+        // share the same type (e.g. template<bool A, bool B>).
+        let member_name = member_die
+            .attr_value(gimli::DW_AT_name)
+            .and_then(|v| self.attribute_to_string(v));
+
         // We need the parent struct's type DIE to find template params.
         // The parent variable's type_node_offset points to the struct's type DIE.
         let type_offset = parent_variable.type_node_offset?;
@@ -2252,16 +2244,17 @@ impl UnitInfo {
         let root = tree.root().ok()?;
         let mut children = root.children();
 
+        // Collect all matching template params (same type) to detect ambiguity.
+        let mut matches: Vec<(Option<String>, String)> = Vec::new();
+
         while let Ok(Some(child)) = children.next() {
             if child.entry().tag() == gimli::DW_TAG_template_value_parameter {
-                // Check if this template param's type matches the constexpr member's type.
                 let param_type = match child.entry().attr_value(gimli::DW_AT_type) {
                     Some(AttributeValue::UnitRef(offset)) => self.unwrap_type_modifiers(offset),
                     _ => continue,
                 };
 
                 if param_type == member_type_offset {
-                    // Type matches — extract the const_value.
                     if let Some(attr) = child.entry().attr(gimli::DW_AT_const_value) {
                         let value = if let Some(v) = attr.value().udata_value() {
                             v.to_string()
@@ -2271,17 +2264,51 @@ impl UnitInfo {
                             continue;
                         };
 
-                        tracing::trace!(
-                            "Resolved static constexpr member from template value param = {}",
-                            value,
-                        );
-                        return Some(value);
+                        let param_name = child
+                            .entry()
+                            .attr_value(gimli::DW_AT_name)
+                            .and_then(|v| self.attribute_to_string(v));
+
+                        matches.push((param_name, value));
                     }
                 }
             }
         }
 
-        None
+        // If exactly one type-matching param, use it. If multiple, try name
+        // disambiguation. If still ambiguous, return None rather than guessing.
+        match matches.len() {
+            0 => None,
+            1 => {
+                let (_, value) = matches.remove(0);
+                tracing::trace!(
+                    "Resolved static constexpr member from template value param = {value}",
+                );
+                Some(value)
+            }
+            _ => {
+                if let Some(ref name) = member_name {
+                    let name_matches: Vec<_> = matches
+                        .iter()
+                        .filter(|(pn, _)| pn.as_deref() == Some(name.as_str()))
+                        .collect();
+                    if name_matches.len() == 1 {
+                        let value = name_matches[0].1.clone();
+                        tracing::trace!(
+                            "Resolved static constexpr '{name}' from template param = {value}",
+                        );
+                        return Some(value);
+                    }
+                }
+                tracing::debug!(
+                    "Ambiguous template param match for constexpr member {:?} \
+                     ({} candidates with same type), skipping",
+                    member_name,
+                    matches.len(),
+                );
+                None
+            }
+        }
     }
 
     fn handle_memory_location_special_cases(
