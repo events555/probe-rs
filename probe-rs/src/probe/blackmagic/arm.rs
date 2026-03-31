@@ -428,11 +428,12 @@ impl SwoAccess for BlackMagicProbeArmDebug {
 }
 
 impl SwdSequence for BlackMagicProbeArmDebug {
-    fn swj_sequence(&mut self, _bit_len: u8, _bits: u64) -> Result<(), DebugProbeError> {
+    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
         // No-op for BMP: raw SWD bit sequences conflict with the BMP firmware's
         // internal ADIv5 state machine. The BMP's SWD init (!SS) already handles
         // line resets, and all DP/AP access goes through the high-level remote
         // protocol commands (!Ad, !Aa, !Am, etc.) which manage SWD internally.
+        tracing::debug!("BMP: swj_sequence({bit_len} bits, {bits:#x}) suppressed (no-op)");
         Ok(())
     }
 
@@ -687,8 +688,9 @@ impl ArmMemoryInterface for BlackMagicProbeMemoryInterface<'_> {
 }
 
 impl SwdSequence for BlackMagicProbeMemoryInterface<'_> {
-    fn swj_sequence(&mut self, _bit_len: u8, _bits: u64) -> Result<(), DebugProbeError> {
+    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
         // No-op for BMP: see BlackMagicProbeArmDebug::swj_sequence
+        tracing::debug!("BMP: swj_sequence({bit_len} bits, {bits:#x}) suppressed (no-op)");
         Ok(())
     }
 
@@ -799,6 +801,8 @@ impl BlackMagicProbeMemoryInterface<'_> {
         if data.len() * 2 + 42 >= super::BLACK_MAGIC_REMOTE_SIZE_MAX {
             return Err(ArmError::OutOfBounds);
         }
+        // Update the CSW Size field to match the actual access width, same as read path.
+        let csw = (self.csw & !0x7) | (align as u32);
         let command = match self.current_ap.ap_address().ap() {
             ApAddress::V1(_) => match self.probe.probe.remote_protocol {
                 ProtocolVersion::V0 => {
@@ -810,7 +814,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 }
                 ProtocolVersion::V0P => RemoteCommand::MemWriteV0P {
                     apsel: 0,
-                    csw: self.csw,
+                    csw,
                     align,
                     offset: offset
                         .try_into()
@@ -820,7 +824,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 ProtocolVersion::V1 | ProtocolVersion::V2 => RemoteCommand::MemWriteV1 {
                     index: self.index,
                     apsel: 0,
-                    csw: self.csw,
+                    csw,
                     align,
                     offset: offset
                         .try_into()
@@ -830,7 +834,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 ProtocolVersion::V3 => RemoteCommand::MemWriteV3 {
                     index: self.index,
                     apsel: 0,
-                    csw: self.csw,
+                    csw,
                     align,
                     offset: offset
                         .try_into()
@@ -840,7 +844,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 ProtocolVersion::V4 => RemoteCommand::MemWriteV4 {
                     index: self.index,
                     apsel: 0,
-                    csw: self.csw,
+                    csw,
                     align,
                     offset,
                     data,
@@ -858,7 +862,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 RemoteCommand::AdiV6MemWriteV4 {
                     index: self.index,
                     apsel,
-                    csw: self.csw,
+                    csw,
                     align,
                     offset,
                     data,
