@@ -117,17 +117,29 @@ impl DebugInfo {
         // Extract the ELF symbol table for fallback variable resolution.
         // This allows resolving declaration-only DWARF entries (extern variables)
         // that have no DW_AT_location but do have an ELF symbol with an address.
+        // For C++ symbols, we also store the demangled name as a key so that
+        // DWARF entries using unmangled names can be matched.
         let mut symbol_table = HashMap::new();
         for symbol in object.symbols() {
             if let Ok(name) = symbol.name() {
                 let addr = symbol.address();
                 if !name.is_empty() && addr != 0 && symbol.size() > 0 {
+                    // Store under the raw (possibly mangled) name.
                     symbol_table.insert(name.to_string(), addr);
+
+                    // Also store under the demangled name if it differs.
+                    let demangled = addr2line::demangle_auto(
+                        std::borrow::Cow::Borrowed(name),
+                        None,
+                    );
+                    if demangled != name {
+                        symbol_table.insert(demangled.into_owned(), addr);
+                    }
                 }
             }
         }
         tracing::debug!(
-            "Loaded {} symbols from ELF symbol table for fallback resolution",
+            "Loaded {} symbol table entries (with demangled aliases) for fallback resolution",
             symbol_table.len()
         );
 
