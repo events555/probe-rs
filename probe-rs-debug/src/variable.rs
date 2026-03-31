@@ -332,6 +332,15 @@ impl VariableType {
         matches!(self, VariableType::Array { .. })
     }
 
+    /// Is this a char-like base type (for string display of char arrays)?
+    pub fn is_char_type(&self) -> bool {
+        match self {
+            VariableType::Base(name) => matches!(name.as_str(), "char" | "unsigned char"),
+            VariableType::Modified(_, inner) => inner.is_char_type(),
+            _ => false,
+        }
+    }
+
     /// Returns the string representation of the variable type's kind.
     pub fn kind(&self) -> &str {
         match self {
@@ -763,6 +772,11 @@ impl Variable {
             VariableType::Pointer(_) => {
                 format_pointer_value(variable_cache, indentation, first_child)
             }
+            VariableType::Array { item_type_name, .. }
+                if item_type_name.is_char_type() =>
+            {
+                format_char_array_as_string(variable_cache, children, &type_name)
+            }
             VariableType::Array { .. } => {
                 format_array_value(variable_cache, indentation, children, &type_name)
             }
@@ -839,6 +853,35 @@ fn format_pointer_value(
 /// Format any array like value.
 ///
 /// Recursively formats all child values.
+/// Format a `char[]` or `const char[]` as a quoted string.
+fn format_char_array_as_string<'a>(
+    variable_cache: &VariableCache,
+    children: &mut impl Iterator<Item = &'a Variable>,
+    type_name: &str,
+) -> String {
+    let mut s = String::new();
+    for child in children {
+        let ch_str = child.to_string(variable_cache);
+        // Each char child's value is a single character (from CChar display).
+        // Stop at null terminator.
+        if let Some(c) = ch_str.chars().next() {
+            if c == '\0' {
+                break;
+            }
+            // Handle escaped chars like \x00
+            if ch_str.starts_with("\\x") {
+                if ch_str == "\\x00" {
+                    break;
+                }
+                s.push_str(&ch_str);
+            } else {
+                s.push(c);
+            }
+        }
+    }
+    format!("{type_name} = \"{s}\"")
+}
+
 fn format_array_value<'a>(
     variable_cache: &VariableCache,
     indentation: usize,
