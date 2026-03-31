@@ -387,6 +387,31 @@ impl UnitInfo {
                         // TODO: Implement [documented RUST extensions to DWARF standard](https://rustc-dev-guide.rust-lang.org/debugging-support-in-rustc.html?highlight=dwarf#dwarf-and-rustc)
                     }
                     gimli::DW_AT_type => {
+                        // Static constexpr declaration members (e.g. C++ static constexpr
+                        // class members) have no instance storage. Skip full type processing
+                        // which would incorrectly inherit the parent struct's memory location.
+                        // Their value will be resolved from template parameters in process_tree.
+                        let is_static_constexpr = matches!(
+                            attributes_entry.attr_value(gimli::DW_AT_declaration),
+                            Some(AttributeValue::Flag(true))
+                        ) && matches!(
+                            attributes_entry.attr_value(gimli::DW_AT_const_expr),
+                            Some(AttributeValue::Flag(true))
+                        );
+                        if is_static_constexpr {
+                            // Just resolve the type name without processing memory location.
+                            if let Ok((unit_info, referenced_type_node)) =
+                                debug_info.resolve_die_reference_with_unit(&attr, attr_unit)
+                            {
+                                if let Ok(Some(name)) =
+                                    unit_info.extract_type_name(debug_info, &referenced_type_node)
+                                {
+                                    child_variable.type_name = VariableType::Base(name);
+                                }
+                            }
+                            continue;
+                        }
+
                         // The rules to calculate the type of a child variable are complex, and depend on a number of
                         // other attributes.
                         // Depending on the presence and value of these attributes, the [Variable::memory_location] may
@@ -681,10 +706,47 @@ impl UnitInfo {
                         false
                     };
 
-                    // Do not keep declarations that still have no location (truly absent),
-                    // PhantomData nodes, or variant parts that we have already used.
+                    // Static members (DW_AT_declaration) don't have instance storage.
+                    // The type resolution path may have incorrectly inherited the
+                    // parent struct's address. Reset it.
+                    if is_declaration
+                        && !matches!(
+                            child_variable.memory_location,
+                            VariableLocation::Value | VariableLocation::Unknown
+                        )
+                        && child_variable.value.is_empty()
+                    {
+                        child_variable.memory_location = VariableLocation::Unknown;
+                    }
+
+                    // For static constexpr members (DW_AT_const_expr + DW_AT_declaration)
+                    // with no value, try to resolve from the parent struct's template
+                    // value parameters. This handles cases like:
+                    //   template <typename T, bool bipolar>
+                    //   struct S { static constexpr bool m_bipolar = bipolar; };
+                    let is_const_expr = matches!(
+                        child_node.entry().attr_value(gimli::DW_AT_const_expr),
+                        Some(AttributeValue::Flag(true))
+                    );
+                    if is_declaration
+                        && is_const_expr
+                        && child_variable.value.is_empty()
+                        && child_variable.memory_location == VariableLocation::Unknown
+                    {
+                        if let Some(value) = self.resolve_constexpr_from_template_params(
+                            child_node.entry(),
+                            parent_variable,
+                        ) {
+                            child_variable.set_value(VariableValue::Valid(value));
+                            child_variable.memory_location = VariableLocation::Value;
+                        }
+                    }
+
+                    // Do not keep declarations that still have no location and no value
+                    // (truly absent), PhantomData nodes, or variant parts already used.
                     if (is_declaration
-                        && child_variable.memory_location == VariableLocation::Unknown)
+                        && child_variable.memory_location == VariableLocation::Unknown
+                        && child_variable.value.is_empty())
                         || child_variable.type_name.is_phantom_data()
                         || child_variable.name == VariableName::Artificial
                     {
@@ -1788,12 +1850,23 @@ impl UnitInfo {
             }
         }
 
-        self.handle_memory_location_special_cases(
-            node_die.offset(),
-            child_variable,
-            parent_variable,
-            memory,
-        );
+        // Static members (DW_AT_declaration with no location) should NOT inherit
+        // their parent struct's address. They don't live inside the struct instance.
+        // Mark them as Unavailable so handle_memory_location_special_cases won't
+        // assign the parent's address to them.
+        let is_static_member = matches!(
+            node_die.attr_value(gimli::DW_AT_declaration),
+            Some(AttributeValue::Flag(true))
+        ) && child_variable.memory_location == VariableLocation::Unknown;
+
+        if !is_static_member {
+            self.handle_memory_location_special_cases(
+                node_die.offset(),
+                child_variable,
+                parent_variable,
+                memory,
+            );
+        }
 
         Ok(())
     }
@@ -2135,6 +2208,81 @@ impl UnitInfo {
     /// A helper function, to handle memory_location for special cases, such as array members, pointers, and intermediate nodes.
     /// Normally, the memory_location is calculated before the type is calculated,
     ///     but special cases require the type related info of the variable to correctly compute the memory_location.
+    /// Try to resolve a `static constexpr` member's value from the parent struct's
+    /// template value parameters. Matches by comparing the member's type DIE offset
+    /// against template parameter type DIE offsets.
+    /// Unwrap const/volatile type modifiers to get the underlying base type offset.
+    fn unwrap_type_modifiers(&self, mut offset: UnitOffset) -> UnitOffset {
+        for _ in 0..10 {
+            // Safety limit to prevent infinite loops
+            let Ok(entry) = self.unit.entry(offset) else {
+                break;
+            };
+            match entry.tag() {
+                gimli::DW_TAG_const_type | gimli::DW_TAG_volatile_type => {
+                    match entry.attr_value(gimli::DW_AT_type) {
+                        Some(AttributeValue::UnitRef(inner)) => offset = inner,
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        offset
+    }
+
+    fn resolve_constexpr_from_template_params(
+        &self,
+        member_die: &gimli::DebuggingInformationEntry<GimliReader>,
+        parent_variable: &Variable,
+    ) -> Option<String> {
+        // Get the member's type offset, unwrapping const/volatile modifiers.
+        let member_type_offset = match member_die.attr_value(gimli::DW_AT_type) {
+            Some(AttributeValue::UnitRef(offset)) => self.unwrap_type_modifiers(offset),
+            _ => return None,
+        };
+
+        // We need the parent struct's type DIE to find template params.
+        // The parent variable's type_node_offset points to the struct's type DIE.
+        let type_offset = parent_variable.type_node_offset?;
+
+        // Walk the struct type DIE's children to find template value parameters.
+        let mut tree = self.unit.entries_tree(Some(type_offset)).ok()?;
+        let root = tree.root().ok()?;
+        let mut children = root.children();
+
+        while let Ok(Some(child)) = children.next() {
+            if child.entry().tag() == gimli::DW_TAG_template_value_parameter {
+                // Check if this template param's type matches the constexpr member's type.
+                let param_type = match child.entry().attr_value(gimli::DW_AT_type) {
+                    Some(AttributeValue::UnitRef(offset)) => self.unwrap_type_modifiers(offset),
+                    _ => continue,
+                };
+
+                if param_type == member_type_offset {
+                    // Type matches — extract the const_value.
+                    if let Some(attr) = child.entry().attr(gimli::DW_AT_const_value) {
+                        let value = if let Some(v) = attr.value().udata_value() {
+                            v.to_string()
+                        } else if let Some(v) = attr.value().sdata_value() {
+                            v.to_string()
+                        } else {
+                            continue;
+                        };
+
+                        tracing::trace!(
+                            "Resolved static constexpr member from template value param = {}",
+                            value,
+                        );
+                        return Some(value);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     fn handle_memory_location_special_cases(
         &self,
         unit_ref: UnitOffset,
