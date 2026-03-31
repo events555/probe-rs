@@ -1497,7 +1497,7 @@ impl UnitInfo {
         frame_info: StackFrameInfo,
         cache: &mut VariableCache,
     ) -> Result<(), DebugError> {
-        let subranges = match self.extract_array_range(node.offset()) {
+        let mut subranges = match self.extract_array_range(node.offset()) {
             Ok(subranges) => subranges,
             Err(error) => {
                 child_variable.set_value(VariableValue::Error(format!(
@@ -1518,6 +1518,30 @@ impl UnitInfo {
                     memory,
                     frame_info,
                 )?;
+
+                // For incomplete arrays (e.g., `char[]` declarations), the DWARF
+                // subrange has no bounds. Try to infer the element count from the
+                // ELF symbol size divided by the element's byte size.
+                if subranges.is_empty() {
+                    if let VariableName::Named(ref name) = child_variable.name {
+                        if let Some(sym_size) = debug_info.lookup_symbol_size(name) {
+                            let elem_size = extract_byte_size(
+                                &self.unit.entry(unit_ref).ok().as_ref().unwrap_or(node),
+                            )
+                            .unwrap_or(1);
+                            if elem_size > 0 {
+                                let count = sym_size / elem_size;
+                                if count > 0 {
+                                    tracing::trace!(
+                                        "Inferred array size {} for '{}' from ELF symbol size {}",
+                                        count, name, sym_size,
+                                    );
+                                    subranges.push(0..count);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Now we can explode the array members.
                 if let Ok(array_member_type_node) = self.unit.entry(unit_ref) {

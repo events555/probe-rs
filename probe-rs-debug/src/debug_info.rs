@@ -46,10 +46,10 @@ pub struct DebugInfo {
 
     pub(crate) addr2line: Option<addr2line::Loader>,
 
-    /// ELF symbol table: maps symbol names to addresses.
+    /// ELF symbol table: maps symbol names to (address, size).
     /// Used as a fallback to resolve declaration-only variables that have no
     /// DWARF location attribute but do have an entry in the ELF symbol table.
-    pub(crate) symbol_table: HashMap<String, u64>,
+    pub(crate) symbol_table: HashMap<String, (u64, u64)>,
 }
 
 impl DebugInfo {
@@ -119,7 +119,7 @@ impl DebugInfo {
         // that have no DW_AT_location but do have an ELF symbol with an address.
         // For C++ symbols, we also store the demangled name as a key so that
         // DWARF entries using unmangled names can be matched.
-        let mut symbol_table: HashMap<String, u64> = HashMap::new();
+        let mut symbol_table: HashMap<String, (u64, u64)> = HashMap::new();
         // Track names that map to multiple different addresses so we can
         // remove them — an ambiguous symbol is worse than no symbol.
         let mut ambiguous_names: std::collections::HashSet<String> =
@@ -127,15 +127,17 @@ impl DebugInfo {
         for symbol in object.symbols() {
             if let Ok(name) = symbol.name() {
                 let addr = symbol.address();
-                if !name.is_empty() && addr != 0 && symbol.size() > 0 {
+                let size = symbol.size();
+                if !name.is_empty() && addr != 0 && size > 0 {
                     let name_str = name.to_string();
+                    let entry = (addr, size);
 
                     // Insert or detect collision for the raw (possibly mangled) name.
                     Self::insert_or_mark_ambiguous(
                         &mut symbol_table,
                         &mut ambiguous_names,
                         name_str.clone(),
-                        addr,
+                        entry,
                     );
 
                     // Also store under the demangled name if it differs.
@@ -148,7 +150,7 @@ impl DebugInfo {
                             &mut symbol_table,
                             &mut ambiguous_names,
                             demangled.into_owned(),
-                            addr,
+                            entry,
                         );
                     }
                 }
@@ -182,20 +184,20 @@ impl DebugInfo {
         })
     }
 
-    /// Insert a symbol name→address mapping, or mark it as ambiguous if the
-    /// name already maps to a *different* address.
+    /// Insert a symbol name→(address,size) mapping, or mark it as ambiguous if
+    /// the name already maps to a *different* address.
     fn insert_or_mark_ambiguous(
-        table: &mut HashMap<String, u64>,
+        table: &mut HashMap<String, (u64, u64)>,
         ambiguous: &mut std::collections::HashSet<String>,
         name: String,
-        addr: u64,
+        entry: (u64, u64),
     ) {
         match table.entry(name) {
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(addr);
+                e.insert(entry);
             }
             std::collections::hash_map::Entry::Occupied(e) => {
-                if *e.get() != addr {
+                if e.get().0 != entry.0 {
                     ambiguous.insert(e.key().clone());
                 }
             }
@@ -203,9 +205,13 @@ impl DebugInfo {
     }
 
     /// Look up a symbol's address in the ELF symbol table.
-    /// Used as a fallback for DWARF declaration-only variables.
     pub(crate) fn lookup_symbol_address(&self, name: &str) -> Option<u64> {
-        self.symbol_table.get(name).copied()
+        self.symbol_table.get(name).map(|(addr, _)| *addr)
+    }
+
+    /// Look up a symbol's size in the ELF symbol table.
+    pub(crate) fn lookup_symbol_size(&self, name: &str) -> Option<u64> {
+        self.symbol_table.get(name).map(|(_, size)| *size)
     }
 
     /// Try get the [`SourceLocation`] for a given address.
