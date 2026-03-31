@@ -240,6 +240,7 @@ impl SessionData {
                 repl_commands,
                 test_data,
                 rtos: None,
+                rtos_threads: vec![],
             })
         }
 
@@ -471,7 +472,9 @@ impl SessionData {
             } else if !cores_halted_previously
                 && let Some(debug_info) = target_core.core_data.debug_info.as_ref()
             {
-                // Attempt RTOS detection on first halt if not already detected.
+                // Attempt RTOS detection on each running→halted transition until
+                // successful. The RTOS data structures may not be initialized on
+                // early halts (e.g. at Reset_Handler before chSysInit()).
                 if target_core.core_data.rtos.is_none() {
                     if let Some(ref binary_path) = core_config.program_binary {
                         target_core.core_data.rtos =

@@ -950,24 +950,32 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
 
         let threads = if let Some(rtos) = &mut target_core.core_data.rtos {
             match rtos.threads(&mut target_core.core) {
-                Ok(rtos_threads) => rtos_threads
-                    .into_iter()
-                    .map(|t| Thread {
-                        id: t.id as i64,
-                        name: if t.is_current {
-                            format!("{} [{}] prio={} *", t.name, t.state, t.priority)
-                        } else {
-                            format!("{} [{}] prio={}", t.name, t.state, t.priority)
-                        },
-                    })
-                    .collect(),
+                Ok(rtos_threads) => {
+                    // Cache the thread list for stack_trace() to use.
+                    target_core.core_data.rtos_threads = rtos_threads.clone();
+                    rtos_threads
+                        .into_iter()
+                        .map(|t| Thread {
+                            id: t.id as i64,
+                            name: if t.is_current {
+                                format!("{} [{}] prio={} *", t.name, t.state, t.priority)
+                            } else {
+                                format!("{} [{}] prio={}", t.name, t.state, t.priority)
+                            },
+                        })
+                        .collect()
+                }
                 Err(e) => {
-                    tracing::warn!("RTOS thread enumeration failed: {e}");
-                    // Fall back to core-as-thread.
-                    vec![Thread {
-                        id: target_core.id() as i64,
-                        name: target_core.core_data.target_name.clone(),
-                    }]
+                    // RTOS is detected but thread enumeration failed. Propagate
+                    // the error rather than silently falling back to a fake
+                    // single-thread response (which would use a different ID
+                    // domain and confuse the DAP client).
+                    return self.send_response::<()>(
+                        request,
+                        Err(&DebuggerError::Other(anyhow!(
+                            "RTOS thread enumeration failed: {e}"
+                        ))),
+                    );
                 }
             }
         } else {
@@ -1004,30 +1012,48 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
 
         // If an RTOS is active and the requested thread is not the currently
         // running one, unwind from the saved register context instead of the
-        // live core registers.
-        let rtos_thread_frames = if let Some(rtos) = &mut target_core.core_data.rtos {
+        // live core registers. We use the cached thread list from the last
+        // `threads()` call to avoid re-enumerating (which is both slow over
+        // the debug link and introduces a TOCTOU race).
+        let rtos_thread_frames = if target_core.core_data.rtos.is_some() {
             let requested_thread_id = arguments.thread_id as u64;
-            // Check if this thread is the currently running one.
-            let is_current = rtos
-                .threads(&mut target_core.core)
-                .ok()
-                .and_then(|threads| threads.iter().find(|t| t.id == requested_thread_id).cloned())
-                .is_some_and(|t| t.is_current);
 
-            if !is_current {
-                // Non-current thread: unwind from saved registers.
-                match Self::unwind_rtos_thread(target_core, requested_thread_id) {
-                    Ok(frames) => Some(frames),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to unwind RTOS thread {:#x}: {e}",
-                            requested_thread_id
-                        );
-                        None
+            let cached_thread = target_core
+                .core_data
+                .rtos_threads
+                .iter()
+                .find(|t| t.id == requested_thread_id);
+
+            match cached_thread {
+                Some(t) if t.is_current => {
+                    None // Current thread: use live core stack frames below.
+                }
+                Some(_) => {
+                    // Non-current thread: unwind from saved registers.
+                    match Self::unwind_rtos_thread(target_core, requested_thread_id) {
+                        Ok(frames) => Some(frames),
+                        Err(e) => {
+                            return self.send_response::<()>(
+                                request,
+                                Err(&DebuggerError::Other(anyhow!(
+                                    "Failed to unwind RTOS thread {:#x}: {e}",
+                                    requested_thread_id
+                                ))),
+                            );
+                        }
                     }
                 }
-            } else {
-                None // Current thread: use live core stack frames below.
+                None => {
+                    // Thread ID not found in cached list — don't silently
+                    // fall through to the current thread's frames.
+                    return self.send_response::<()>(
+                        request,
+                        Err(&DebuggerError::Other(anyhow!(
+                            "Unknown RTOS thread ID {:#x}",
+                            requested_thread_id
+                        ))),
+                    );
+                }
             }
         } else {
             None

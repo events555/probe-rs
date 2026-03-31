@@ -63,6 +63,9 @@ pub struct CoreData {
     pub test_data: Box<dyn Any>,
     /// RTOS thread awareness, if detected.
     pub rtos: Option<Box<dyn RtosAwareness>>,
+    /// Cached RTOS thread list from the last successful `threads()` call.
+    /// Used by `stack_trace()` to determine thread status without re-enumerating.
+    pub rtos_threads: Vec<probe_rs::rtos::RtosThread>,
 }
 
 /// File descriptor for files opened by the target.
