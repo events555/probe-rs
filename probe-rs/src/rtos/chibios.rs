@@ -1,18 +1,21 @@
 //! ChibiOS/RT thread awareness.
 //!
 //! ChibiOS embeds a `chdebug_t` structure in the binary (via `chregistry.h`)
-//! that contains all the byte-offsets into the thread struct. This makes
-//! ChibiOS uniquely easy to support — no hardcoded offsets, no version-specific
-//! tables. We just read the signature and follow where it points.
+//! that contains all the byte-offsets into the thread struct and the system
+//! struct. This makes ChibiOS uniquely easy to support — no hardcoded offsets,
+//! no version-specific tables. We just read the signature and follow where it
+//! points.
 //!
 //! # Detection
 //!
 //! We look for the `ch_debug` symbol. The first 5 bytes must be `"main\0"`.
+//! We also need `ch_system` to locate OS instances.
 //!
 //! # Thread enumeration
 //!
-//! The thread registry is a doubly-linked list rooted at the `rlist` (or `ch`)
-//! symbol. We walk `cf_off_newer` pointers until we loop back to the root.
+//! The `chdebug_t` signature describes how many OS instances exist and where
+//! their thread registries live (as byte offsets within the system and instance
+//! structs). We walk the registry linked list for each instance.
 //!
 //! # Register recovery
 //!
@@ -27,6 +30,10 @@ use crate::MemoryInterface;
 
 /// CPACR register address (Coprocessor Access Control Register).
 const CPACR_ADDR: u64 = 0xE000_ED88;
+
+/// Minimum size of the `chdebug_t` signature we need to read.
+/// Covers through `off_inst_rfcu` (byte 42).
+const CHDEBUG_MIN_SIZE: usize = 43;
 
 /// Thread state names, indexed by the `state` byte in the thread struct.
 const THREAD_STATES: &[&str] = &[
@@ -56,12 +63,14 @@ const MAX_THREADS: usize = 256;
 
 /// The ChibiOS memory signature (`chdebug_t`), read from the `ch_debug` symbol.
 ///
-/// This is a packed struct that ChibiOS places in memory to tell debuggers
-/// where fields live inside `thread_t`. All values are byte offsets.
+/// All values are byte offsets unless noted otherwise. The layout matches
+/// `chregistry.h` in ChibiOS/RT.
 #[derive(Debug)]
-#[allow(dead_code)] // Fields parsed from the binary signature; not all used yet.
+#[allow(dead_code)]
 struct ChibiDebugSignature {
+    // -- Basic thread struct offsets (always present) --
     ptr_size: u8,
+    time_size: u8,
     thread_size: u8,
     off_prio: u8,
     off_ctx: u8,
@@ -71,32 +80,54 @@ struct ChibiDebugSignature {
     off_stklimit: u8,
     off_state: u8,
     off_flags: u8,
+    off_refs: u8,
+    off_preempt: u8,
+    off_time: u8,
+    intctx_size: u8,
+    interval_size: u8,
+
+    // -- Instance-aware fields (ChibiOS 21.11+) --
+    instances_num: u8,
+    off_sys_state: u8,
+    off_sys_instances: u8,
+    off_sys_reglist: u8,
+    off_inst_rlist_current: u8,
+    off_inst_rlist: u8,
+    off_inst_vtlist: u8,
+    off_inst_reglist: u8,
+    off_inst_core_id: u8,
+
+    /// True if the signature is large enough to contain instance-aware fields.
+    has_instance_info: bool,
 }
 
 impl ChibiDebugSignature {
     /// Read and validate the signature from target memory.
     fn read_from(core: &mut Core, addr: u64) -> Result<Self, Error> {
-        let mut buf = [0u8; 20];
-        core.read_8(addr, &mut buf)?;
+        // First read the size byte to know how much to read.
+        let mut header = [0u8; 6];
+        core.read_8(addr, &mut header)?;
 
         // Bytes 0..5: identifier, must be "main\0"
-        if &buf[0..5] != b"main\0" {
+        if &header[0..5] != b"main\0" {
+            return Err(Error::Other(
+                "ChibiOS debug signature not found (expected 'main\\0' magic)".to_string(),
+            ));
+        }
+
+        let struct_size = header[5] as usize;
+        if struct_size < 20 {
             return Err(Error::Other(format!(
-                "ChibiOS debug signature not found (expected 'main\\0' magic)"
+                "ChibiOS debug signature too small: {struct_size} < 20"
             )));
         }
 
-        // Byte 5: ch_size (size of this struct), must be >= 20
-        let struct_size = buf[5];
-        if (struct_size as usize) < buf.len() {
-            return Err(Error::Other(format!(
-                "ChibiOS debug signature too small: {} < {}",
-                struct_size,
-                buf.len()
-            )));
-        }
+        // Read the full signature.
+        let read_size = struct_size.min(CHDEBUG_MIN_SIZE);
+        let mut buf = vec![0u8; read_size];
+        core.read_8(addr, &mut buf)?;
 
-        // Byte 8: pointer size, must be 4 for 32-bit targets
+        // Byte 8: pointer size, must be 4 for 32-bit targets.
         if buf[8] != 4 {
             return Err(Error::Other(format!(
                 "ChibiOS reports pointer size {}, expected 4",
@@ -104,8 +135,11 @@ impl ChibiDebugSignature {
             )));
         }
 
+        let has_instance_info = struct_size >= CHDEBUG_MIN_SIZE;
+
         Ok(Self {
             ptr_size: buf[8],
+            time_size: buf[9],
             thread_size: buf[10],
             off_prio: buf[11],
             off_ctx: buf[12],
@@ -115,6 +149,23 @@ impl ChibiDebugSignature {
             off_stklimit: buf[16],
             off_state: buf[17],
             off_flags: buf[18],
+            off_refs: buf[19],
+            off_preempt: if read_size > 20 { buf[20] } else { 0 },
+            off_time: if read_size > 21 { buf[21] } else { 0 },
+            // bytes 22-25: reserved
+            intctx_size: if read_size > 26 { buf[26] } else { 0 },
+            interval_size: if read_size > 27 { buf[27] } else { 0 },
+            instances_num: if read_size > 28 { buf[28] } else { 1 },
+            off_sys_state: if read_size > 29 { buf[29] } else { 0 },
+            off_sys_instances: if read_size > 30 { buf[30] } else { 0 },
+            off_sys_reglist: if read_size > 31 { buf[31] } else { 0 },
+            // bytes 33-36: off_sys_reserved
+            off_inst_rlist_current: if read_size > 37 { buf[37] } else { 0 },
+            off_inst_rlist: if read_size > 38 { buf[38] } else { 0 },
+            off_inst_vtlist: if read_size > 39 { buf[39] } else { 0 },
+            off_inst_reglist: if read_size > 40 { buf[40] } else { 0 },
+            off_inst_core_id: if read_size > 41 { buf[41] } else { 0 },
+            has_instance_info,
         })
     }
 }
@@ -157,10 +208,21 @@ impl FpuState {
     }
 }
 
+/// Per-instance registry info derived from `ch_system`.
+#[derive(Debug)]
+struct InstanceInfo {
+    /// Address of the instance struct in target memory.
+    instance_addr: u64,
+    /// Address of the registry list root for this instance.
+    reglist_addr: u64,
+    /// Address of the `rlist.current` pointer for this instance.
+    current_thread_ptr_addr: u64,
+}
+
 /// ChibiOS/RT thread awareness backend.
 pub struct ChibiOsAwareness {
     sig: ChibiDebugSignature,
-    rlist_addr: u64,
+    instances: Vec<InstanceInfo>,
     fpu: FpuState,
 }
 
@@ -169,19 +231,108 @@ impl ChibiOsAwareness {
     pub fn detect(core: &mut Core, symbols: &ResolvedSymbols) -> Option<Box<dyn RtosAwareness>> {
         let ch_debug_addr = *symbols.get("ch_debug")?;
 
-        let sig = ChibiDebugSignature::read_from(core, ch_debug_addr).ok()?;
+        let sig = match ChibiDebugSignature::read_from(core, ch_debug_addr) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("ChibiOS signature read failed: {e}");
+                return None;
+            }
+        };
 
-        // ChibiOS 2.x uses `rlist` directly; ChibiOS 3+ nests it inside `ch`.
-        let rlist_addr = symbols
-            .get("rlist")
-            .or_else(|| symbols.get("ch"))
-            .copied()?;
+        tracing::debug!("ChibiOS signature: {sig:?}");
+
+        let instances = if sig.has_instance_info {
+            // Modern ChibiOS: derive instance addresses from ch_system + offsets.
+            let ch_system_addr = match symbols.get("ch_system") {
+                Some(&addr) => addr,
+                None => {
+                    tracing::debug!(
+                        "ChibiOS: ch_debug has instance info but 'ch_system' symbol not found"
+                    );
+                    return None;
+                }
+            };
+
+            let num = sig.instances_num.max(1) as usize;
+            let mut instances = Vec::with_capacity(num);
+
+            for i in 0..num {
+                // Each instance is ptr_size apart in the instances array.
+                let instance_ptr_addr = ch_system_addr
+                    + sig.off_sys_instances as u64
+                    + (i as u64) * (sig.ptr_size as u64);
+
+                let instance_addr = match core.read_word_32(instance_ptr_addr) {
+                    Ok(addr) => addr as u64,
+                    Err(e) => {
+                        tracing::debug!(
+                            "ChibiOS: failed to read instance {i} pointer at {instance_ptr_addr:#x}: {e}"
+                        );
+                        continue;
+                    }
+                };
+
+                if instance_addr == 0 {
+                    tracing::debug!("ChibiOS: instance {i} pointer is NULL, skipping");
+                    continue;
+                }
+
+                let reglist_addr = instance_addr + sig.off_inst_reglist as u64;
+                let current_thread_ptr_addr =
+                    instance_addr + sig.off_inst_rlist_current as u64;
+
+                tracing::debug!(
+                    "ChibiOS instance {i}: addr={instance_addr:#x}, \
+                     reglist={reglist_addr:#x}, current_ptr={current_thread_ptr_addr:#x}"
+                );
+
+                instances.push(InstanceInfo {
+                    instance_addr,
+                    reglist_addr,
+                    current_thread_ptr_addr,
+                });
+            }
+
+            if instances.is_empty() {
+                tracing::debug!("ChibiOS: no valid instances found");
+                return None;
+            }
+
+            instances
+        } else {
+            // Legacy ChibiOS (pre-instance): fall back to `rlist` or `ch` symbols.
+            let rlist_addr = symbols
+                .get("rlist")
+                .or_else(|| symbols.get("ch"))
+                .copied();
+
+            match rlist_addr {
+                Some(addr) => {
+                    tracing::debug!(
+                        "ChibiOS legacy mode: rlist at {addr:#x}"
+                    );
+                    vec![InstanceInfo {
+                        instance_addr: addr,
+                        reglist_addr: addr,
+                        // Legacy: current thread pointer is at rlist + off_name
+                        // (the name offset in the ready list header coincides with current).
+                        current_thread_ptr_addr: addr + sig.off_name as u64,
+                    }]
+                }
+                None => {
+                    tracing::debug!(
+                        "ChibiOS: legacy signature but no 'rlist'/'ch' symbol found"
+                    );
+                    return None;
+                }
+            }
+        };
 
         let fpu = FpuState::detect(core).ok()?;
 
         Some(Box::new(Self {
             sig,
-            rlist_addr,
+            instances,
             fpu,
         }))
     }
@@ -195,6 +346,11 @@ impl RtosAwareness for ChibiOsAwareness {
                 optional: false,
             },
             SymbolQuery {
+                name: "ch_system",
+                optional: true,
+            },
+            // Legacy fallbacks (ChibiOS 2.x / early 3.x without instance support).
+            SymbolQuery {
                 name: "ch",
                 optional: true,
             },
@@ -207,87 +363,93 @@ impl RtosAwareness for ChibiOsAwareness {
 
     fn threads(&mut self, core: &mut Core) -> Result<Vec<RtosThread>, Error> {
         let sig = &self.sig;
-        let rlist = self.rlist_addr;
+        let mut all_threads = Vec::new();
 
-        // The current thread pointer lives at `rlist + cf_off_name` by ChibiOS
-        // convention — the `cf_off_name` offset in the ready list header happens
-        // to coincide with the `current` field.
-        let current_thread = core.read_word_32(rlist + sig.off_name as u64)? as u64;
+        for inst in &self.instances {
+            let reglist = inst.reglist_addr;
 
-        // First pass: validate the doubly-linked list integrity and count threads.
-        let mut count = 0usize;
-        let mut addr = core.read_word_32(rlist + sig.off_newer as u64)? as u64;
-        let mut prev = rlist;
+            // Read the current thread pointer for this instance.
+            let current_thread = core.read_word_32(inst.current_thread_ptr_addr)? as u64;
 
-        loop {
-            if addr == 0 {
-                return Err(Error::Other(format!(
-                    "ChibiOS registry: NULL pointer in thread list"
-                )));
+            // Walk the registry doubly-linked list.
+            let mut count = 0usize;
+            let mut addr = core.read_word_32(reglist)? as u64;
+
+            // Validate list integrity in first pass.
+            let mut prev = reglist;
+            let start_addr = addr;
+            loop {
+                if addr == 0 {
+                    return Err(Error::Other(
+                        "ChibiOS registry: NULL pointer in thread list".to_string(),
+                    ));
+                }
+                if addr == reglist {
+                    break; // Full loop completed
+                }
+
+                // Integrity: check backward pointer matches where we came from.
+                let older = core.read_word_32(addr + 4)? as u64; // second pointer in queue node
+                if older != prev {
+                    tracing::warn!(
+                        "ChibiOS registry: backward pointer mismatch \
+                         (older={older:#x}, expected prev={prev:#x}), continuing anyway"
+                    );
+                }
+
+                count += 1;
+                if count > MAX_THREADS {
+                    return Err(Error::Other(format!(
+                        "ChibiOS registry: more than {MAX_THREADS} threads, likely corrupted"
+                    )));
+                }
+
+                prev = addr;
+                addr = core.read_word_32(addr)? as u64; // first pointer = next
             }
-            if addr == rlist {
-                break; // Full loop completed
-            }
 
-            // Integrity: check backward pointer matches where we came from
-            let older = core.read_word_32(addr + sig.off_older as u64)? as u64;
-            if older != prev {
-                return Err(Error::Other(format!(
-                    "ChibiOS registry: doubly-linked list integrity check failed \
-                     (older={:#x}, expected prev={:#x})",
-                    older,
-                    prev,
-                )));
-            }
+            // Second pass: collect thread details.
+            // The registry queue nodes are embedded in thread_t at off_newer/off_older.
+            // To get the thread_t base address from a queue node, subtract the offset.
+            addr = core.read_word_32(reglist)? as u64;
 
-            count += 1;
-            if count > MAX_THREADS {
-                return Err(Error::Other(format!(
-                    "ChibiOS registry: more than {} threads, likely corrupted",
-                    MAX_THREADS
-                )));
-            }
+            while addr != reglist {
+                // The queue node is at offset off_newer within thread_t.
+                // So thread_base = queue_node_addr - off_newer.
+                let thread_base = addr - sig.off_newer as u64;
 
-            prev = addr;
-            addr = core.read_word_32(addr + sig.off_newer as u64)? as u64;
-        }
-
-        // Second pass: collect thread details.
-        let mut threads = Vec::with_capacity(count);
-        addr = core.read_word_32(rlist + sig.off_newer as u64)? as u64;
-
-        while addr != rlist {
-            let name_ptr = core.read_word_32(addr + sig.off_name as u64)? as u64;
-            let name = if name_ptr != 0 {
-                read_cstring(core, name_ptr, MAX_THREAD_NAME)?
-            } else {
-                String::new()
-            };
-
-            let state_byte = core.read_word_8(addr + sig.off_state as u64)?;
-            let state = THREAD_STATES
-                .get(state_byte as usize)
-                .unwrap_or(&"Unknown")
-                .to_string();
-
-            let priority = core.read_word_8(addr + sig.off_prio as u64)?;
-
-            threads.push(RtosThread {
-                id: addr,
-                name: if name.is_empty() {
-                    "unnamed".into()
+                let name_ptr = core.read_word_32(thread_base + sig.off_name as u64)? as u64;
+                let name = if name_ptr != 0 {
+                    read_cstring(core, name_ptr, MAX_THREAD_NAME)?
                 } else {
-                    name
-                },
-                state,
-                priority,
-                is_current: addr == current_thread,
-            });
+                    String::new()
+                };
 
-            addr = core.read_word_32(addr + sig.off_newer as u64)? as u64;
+                let state_byte = core.read_word_8(thread_base + sig.off_state as u64)?;
+                let state = THREAD_STATES
+                    .get(state_byte as usize)
+                    .unwrap_or(&"Unknown")
+                    .to_string();
+
+                let priority = core.read_word_8(thread_base + sig.off_prio as u64)?;
+
+                all_threads.push(RtosThread {
+                    id: thread_base,
+                    name: if name.is_empty() {
+                        "unnamed".into()
+                    } else {
+                        name
+                    },
+                    state,
+                    priority,
+                    is_current: thread_base == current_thread,
+                });
+
+                addr = core.read_word_32(addr)? as u64; // next in queue
+            }
         }
 
-        Ok(threads)
+        Ok(all_threads)
     }
 
     fn thread_registers(
@@ -337,14 +499,7 @@ impl RtosAwareness for ChibiOsAwareness {
         }
 
         // The saved LR from the context switch is the return address — where
-        // the thread will resume. For voluntarily-switched threads this is a
-        // real code address. For threads that were preempted from an ISR, it
-        // may be an EXC_RETURN magic value (e.g. 0xFFFFFFFD); proper handling
-        // of that case requires parsing the hardware exception frame above.
-        //
-        // We report the LR as the PC. The DAP stack_trace handler feeds these
-        // saved registers into debug_info.unwind() for full DWARF-based call
-        // stack unwinding.
+        // the thread will resume. Report it as PC.
         let lr = core.read_word_32(gpr_base + 0x20)?;
         regs.push(SavedRegister {
             id: RegisterId(15), // PC

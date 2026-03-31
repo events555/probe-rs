@@ -576,6 +576,8 @@ pub(crate) fn try_detect_rtos(
     // Gather all symbol queries from all known backends.
     let all_queries = vec![
         probe_rs::rtos::SymbolQuery { name: "ch_debug", optional: false },
+        probe_rs::rtos::SymbolQuery { name: "ch_system", optional: true },
+        // Legacy ChibiOS fallbacks (pre-instance support).
         probe_rs::rtos::SymbolQuery { name: "ch", optional: true },
         probe_rs::rtos::SymbolQuery { name: "rlist", optional: true },
         // Future: add FreeRTOS, Zephyr symbol queries here.
