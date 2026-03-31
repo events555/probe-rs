@@ -973,6 +973,7 @@ impl UnitInfo {
                 | gimli::DW_TAG_base_type
                 | gimli::DW_TAG_pointer_type
                 | gimli::DW_TAG_structure_type
+                | gimli::DW_TAG_class_type
                 | gimli::DW_TAG_enumeration_type
                 | gimli::DW_TAG_array_type
                 | gimli::DW_TAG_subroutine_type
@@ -1253,7 +1254,7 @@ impl UnitInfo {
                     }
                 }
             }
-            gimli::DW_TAG_structure_type => {
+            gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type => {
                 self.extract_struct(
                     type_name,
                     debug_info,

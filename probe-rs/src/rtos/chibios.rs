@@ -224,6 +224,10 @@ pub struct ChibiOsAwareness {
     sig: ChibiDebugSignature,
     instances: Vec<InstanceInfo>,
     fpu: FpuState,
+    /// Thread ID of the currently running thread (updated on each `threads()` call).
+    /// Used to reject `thread_registers()` for the running thread, which has no
+    /// valid saved context.
+    current_thread_id: Option<u64>,
 }
 
 impl ChibiOsAwareness {
@@ -334,6 +338,7 @@ impl ChibiOsAwareness {
             sig,
             instances,
             fpu,
+            current_thread_id: None,
         }))
     }
 }
@@ -364,6 +369,7 @@ impl RtosAwareness for ChibiOsAwareness {
     fn threads(&mut self, core: &mut Core) -> Result<Vec<RtosThread>, Error> {
         let sig = &self.sig;
         let mut all_threads = Vec::new();
+        let mut found_current: Option<u64> = None;
 
         for inst in &self.instances {
             let reglist = inst.reglist_addr;
@@ -433,6 +439,11 @@ impl RtosAwareness for ChibiOsAwareness {
 
                 let priority = core.read_word_8(thread_base + sig.off_prio as u64)?;
 
+                let is_current = thread_base == current_thread;
+                if is_current {
+                    found_current = Some(thread_base);
+                }
+
                 all_threads.push(RtosThread {
                     id: thread_base,
                     name: if name.is_empty() {
@@ -442,13 +453,14 @@ impl RtosAwareness for ChibiOsAwareness {
                     },
                     state,
                     priority,
-                    is_current: thread_base == current_thread,
+                    is_current,
                 });
 
                 addr = core.read_word_32(addr)? as u64; // next in queue
             }
         }
 
+        self.current_thread_id = found_current;
         Ok(all_threads)
     }
 
