@@ -745,11 +745,15 @@ impl UnitInfo {
                         }
                     }
 
-                    // Do not keep declarations that still have no location and no value
-                    // (truly absent), PhantomData nodes, or variant parts already used.
+                    // Do not keep:
+                    // - Declarations that still have no location and no value (truly absent)
+                    // - Unnamed variables with unknown type (DWARF intermediate nodes)
+                    // - PhantomData nodes or variant parts already used
                     if (is_declaration
                         && child_variable.memory_location == VariableLocation::Unknown
                         && child_variable.value.is_empty())
+                        || (child_variable.name == VariableName::Unknown
+                            && child_variable.type_name == VariableType::Unknown)
                         || child_variable.type_name.is_phantom_data()
                         || child_variable.name == VariableName::Artificial
                     {
