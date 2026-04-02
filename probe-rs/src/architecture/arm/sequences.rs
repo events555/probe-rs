@@ -413,18 +413,20 @@ pub(crate) fn cortex_m_wait_for_reset(
             // register read errors while the target is
             // resetting.
             Ok(val) => Dhcsr(val),
-            Err(ArmError::AccessPort {
-                source: AccessPortError::RegisterRead { source, .. },
-                ..
-            }) => {
-                if let Some(ArmError::Dap(DapError::NoAcknowledge)) =
-                    source.downcast_ref::<ArmError>()
-                {
-                    // On PSOC 6, a system reset resets the SWD interface as well,
-                    // so we have to reinitialize.
-                    if let Ok(probe) = interface.get_arm_debug_interface() {
-                        probe.reinitialize()?;
-                    }
+            Err(
+                ArmError::AccessPort {
+                    source: AccessPortError::RegisterRead { .. },
+                    ..
+                }
+                | ArmError::Probe(_),
+            ) => {
+                // A system reset may temporarily break the SWD connection.
+                // This can surface as a DAP NoAcknowledge (native probes) or
+                // as a probe-level communication error (e.g. BMP remote
+                // protocol returning an error for the memory read).
+                // Re-initialize the debug port so subsequent reads succeed.
+                if let Ok(probe) = interface.get_arm_debug_interface() {
+                    probe.reinitialize()?;
                 }
                 continue;
             }

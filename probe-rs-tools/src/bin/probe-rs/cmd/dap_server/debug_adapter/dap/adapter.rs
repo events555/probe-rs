@@ -760,35 +760,28 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
         let current_core_status = target_core.core.status()?;
 
         if current_core_status.is_halted() {
-            if self.halt_after_reset
-                || matches!(
-                    current_core_status,
-                    CoreStatus::Halted(HaltReason::Breakpoint(_))
-                )
-            {
-                let program_counter = target_core
-                    .core
-                    .read_core_reg(target_core.core.program_counter())
-                    .ok();
-                let event_body = Some(StoppedEventBody {
-                    reason: current_core_status
-                        .short_long_status(program_counter)
-                        .0
-                        .to_owned(),
-                    description: Some(current_core_status.short_long_status(program_counter).1),
-                    thread_id: Some(target_core.id() as i64),
-                    preserve_focus_hint: None,
-                    text: None,
-                    all_threads_stopped: Some(self.all_cores_halted),
-                    hit_breakpoint_ids: None,
-                });
-                self.send_event("stopped", event_body)?;
-            } else {
-                tracing::debug!(
-                    "Core is halted, but not due to a breakpoint and halt_after_reset is not set. Continuing."
-                );
-                self.r#continue(target_core, request)?;
-            }
+            // Always report the halted state to the client. The previous
+            // behaviour silently resumed the core when it was halted for a
+            // reason other than a breakpoint and `halt_after_reset` was false.
+            // This caused attach requests to inadvertently resume (and often
+            // reset via watchdog) a target that the user intended to inspect.
+            let program_counter = target_core
+                .core
+                .read_core_reg(target_core.core.program_counter())
+                .ok();
+            let event_body = Some(StoppedEventBody {
+                reason: current_core_status
+                    .short_long_status(program_counter)
+                    .0
+                    .to_owned(),
+                description: Some(current_core_status.short_long_status(program_counter).1),
+                thread_id: Some(target_core.id() as i64),
+                preserve_focus_hint: None,
+                text: None,
+                all_threads_stopped: Some(self.all_cores_halted),
+                hit_breakpoint_ids: None,
+            });
+            self.send_event("stopped", event_body)?;
         }
 
         self.configuration_done = true;

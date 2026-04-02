@@ -1022,7 +1022,12 @@ impl CoreInterface for Armv7m<'_> {
     fn set_hw_breakpoint(&mut self, bp_unit_index: usize, addr: u64) -> Result<(), Error> {
         let addr = valid_32bit_address(addr)?;
 
-        // First make sure they are asking for a breakpoint on a half-word boundary.
+        // Clear the Thumb bit (bit 0) — Cortex-M always executes in Thumb
+        // mode, so callers may pass addresses with the LSB set.  The FP
+        // comparator only cares about the half-word-aligned address.
+        let addr = addr & !0x1;
+
+        // Make sure the resulting address is on a half-word boundary.
         if (addr & 0x1) > 0 {
             return Err(Error::Other(format!(
                 "The requested breakpoint address 0x{addr:08x} is not on a half-word boundary"

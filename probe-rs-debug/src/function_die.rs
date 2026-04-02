@@ -88,29 +88,30 @@ impl<'a> FunctionDie<'a> {
 
         let specification_die;
 
-        // For inlined functions, we also need to find the abstract origin.
-        let abstract_die = if is_inlined_function {
-            let Some(abstract_die) = debug_info.resolve_die_reference(
-                gimli::DW_AT_abstract_origin,
-                &function_die,
-                unit_info,
-            ) else {
-                tracing::debug!("No abstract origin found for inlined function");
-                return Ok(None);
-            };
-            specification_die = debug_info.resolve_die_reference(
-                gimli::DW_AT_specification,
-                &abstract_die,
-                unit_info,
-            );
-            Some(abstract_die)
+        // Resolve DW_AT_abstract_origin and DW_AT_specification.
+        //
+        // Both inlined subroutines AND concrete out-of-line subprograms can
+        // have DW_AT_abstract_origin pointing to the declaration that carries
+        // the function name (GCC emits this pattern).  For inlined functions
+        // the abstract origin is mandatory; for concrete subprograms it is
+        // optional but must still be followed when present.
+        let abstract_die = debug_info.resolve_die_reference(
+            gimli::DW_AT_abstract_origin,
+            &function_die,
+            unit_info,
+        );
+
+        if is_inlined_function && abstract_die.is_none() {
+            tracing::debug!("No abstract origin found for inlined function");
+            return Ok(None);
+        }
+
+        // Check for DW_AT_specification on the abstract origin (if present),
+        // falling back to the concrete function DIE itself.
+        specification_die = if let Some(ref abs) = abstract_die {
+            debug_info.resolve_die_reference(gimli::DW_AT_specification, abs, unit_info)
         } else {
-            specification_die = debug_info.resolve_die_reference(
-                gimli::DW_AT_specification,
-                &function_die,
-                unit_info,
-            );
-            None
+            debug_info.resolve_die_reference(gimli::DW_AT_specification, &function_die, unit_info)
         };
 
         Ok(Some(Self {
@@ -224,8 +225,9 @@ impl<'a> FunctionDie<'a> {
             return attribute.cloned();
         }
 
-        // For inlined function, the *abstract instance* has to be checked if we cannot find the
-        // attribute on the *concrete instance*. The abstract instance my also be a reference to a specification.
+        // The *abstract instance* has to be checked if we cannot find the
+        // attribute on the *concrete instance*. This applies to both inlined
+        // subroutines and concrete subprograms with DW_AT_abstract_origin.
         if let Some(abstract_die) = &self.abstract_die {
             let inlined_specification_die = debug_info.resolve_die_reference(
                 gimli::DW_AT_specification,

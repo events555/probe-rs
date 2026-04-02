@@ -438,13 +438,23 @@ impl<'debug_info> InstructionSequence<'debug_info> {
                 prologue_completed = true;
             }
 
-            // For GNU C, it is known that the `DW_LNS_set_prologue_end` is not set, so we employ the same heuristic as GDB to determine when the prologue is complete.
-            // For other C compilers in the C99/11/17 standard, they will either set the `DW_LNS_set_prologue_end` or they will trigger this heuristic also.
+            // GCC (for both C and C++) often does not emit `DW_LNS_set_prologue_end`,
+            // so we employ the same heuristic as GDB to determine when the prologue
+            // is complete: the first is_stmt row whose line differs from the previous
+            // row (or the end of the sequence) signals the end of the prologue.
             // See https://gcc.gnu.org/legacy-ml/gcc-patches/2011-03/msg02106.html
             if !prologue_completed
                 && matches!(
                     program_language,
-                    gimli::DW_LANG_C99 | gimli::DW_LANG_C11 | gimli::DW_LANG_C17
+                    gimli::DW_LANG_C89
+                        | gimli::DW_LANG_C
+                        | gimli::DW_LANG_C99
+                        | gimli::DW_LANG_C11
+                        | gimli::DW_LANG_C17
+                        | gimli::DW_LANG_C_plus_plus
+                        | gimli::DW_LANG_C_plus_plus_03
+                        | gimli::DW_LANG_C_plus_plus_11
+                        | gimli::DW_LANG_C_plus_plus_14
                 )
                 && let Some(prev_row) = previous_row
                 && (row.end_sequence()
