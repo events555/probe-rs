@@ -123,12 +123,12 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
         let must_halt_debuggee = arguments.terminate_debuggee.unwrap_or(false)
             || arguments.suspend_debuggee.unwrap_or(false);
 
+        let _ = target_core.core.clear_all_hw_breakpoints();
+
         if must_halt_debuggee {
             let _ = target_core.core.halt(Duration::from_millis(100));
         } else {
-            // Resume the core so the target continues running after the debug
-            // session ends. Without this, the core stays halted and RTOS
-            // timers/watchdogs will fault on the next attach.
+            let _ = target_core.core.reset_and_halt(Duration::from_millis(500));
             let _ = target_core.core.run();
         }
 

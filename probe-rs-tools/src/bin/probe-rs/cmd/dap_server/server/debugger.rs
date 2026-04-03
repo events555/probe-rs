@@ -341,6 +341,8 @@ impl Debugger {
             };
         };
 
+        let _ = session_data.clean_up(&self.config);
+
         debug_adapter.show_message(
             MessageSeverity::Error,
             format!("Debug Adapter terminated unexpectedly with an error: {error:?}"),
