@@ -674,6 +674,9 @@ impl CoreInterface for Armv7m<'_> {
     }
 
     fn status(&mut self) -> Result<CoreStatus, Error> {
+        // Flush any pending writes to ensure previous SWD transactions
+        // (e.g. DHCSR writes from step/run) have completed before reading.
+        self.memory.flush()?;
         let dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
 
         if dhcsr.s_lockup() {
@@ -776,8 +779,16 @@ impl CoreInterface for Armv7m<'_> {
     }
 
     fn run(&mut self) -> Result<(), Error> {
-        // Before we run, we always perform a single instruction step, to account for possible breakpoints that might get us stuck on the current instruction.
-        self.step()?;
+        // If we are stopped ON a breakpoint, single-step past it first so
+        // the FPB comparator doesn't immediately re-halt at the same address.
+        // In all other cases (e.g. after an explicit step() by the caller),
+        // stepping again is redundant and can interfere with FPB state.
+        if matches!(
+            self.state.current_state,
+            CoreStatus::Halted(HaltReason::Breakpoint(_))
+        ) {
+            self.step()?;
+        }
 
         let mut dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
 
@@ -1058,7 +1069,27 @@ impl CoreInterface for Armv7m<'_> {
         // address spaces than Rev1.
         let reg_addr = FpRev1CompX::get_mmio_address() + (bp_unit_index * size_of::<u32>()) as u64;
 
+        // Write the comparator, then cycle FPB off→on.  On some targets
+        // (e.g. STM32G4 via BMP) a newly-written comparator does not take
+        // effect until the FPB unit is toggled.  The readbacks between
+        // writes ensure each SWD transaction completes before the next.
         self.memory.write_word_32(reg_addr, val)?;
+        self.memory.flush()?;
+        let _ = self.memory.read_word_32(reg_addr)?; // ensure comparator write landed
+
+        let fp_ctrl_addr = FpCtrl::get_mmio_address();
+        let mut disable = FpCtrl::from(0);
+        disable.set_key(true);
+        disable.set_enable(false);
+        self.memory.write_word_32(fp_ctrl_addr, disable.into())?;
+        self.memory.flush()?;
+        let _ = self.memory.read_word_32(fp_ctrl_addr)?; // ensure disable landed
+
+        let mut enable = FpCtrl::from(0);
+        enable.set_key(true);
+        enable.set_enable(true);
+        self.memory.write_word_32(fp_ctrl_addr, enable.into())?;
+        self.memory.flush()?;
 
         Ok(())
     }
