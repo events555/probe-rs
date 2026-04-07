@@ -208,7 +208,9 @@ impl Session {
             Self::attach_jtag(probe, target, attach_method, permissions, cores)?
         };
 
-        session.clear_all_hw_breakpoints()?;
+        if let Err(err) = session.clear_all_hw_breakpoints() {
+            tracing::warn!("Could not clear stale hardware breakpoints on attach: {:?}", anyhow::anyhow!(err));
+        }
 
         Ok(session)
     }

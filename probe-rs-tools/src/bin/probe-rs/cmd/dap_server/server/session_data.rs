@@ -60,6 +60,10 @@ pub(crate) enum SourceLocationScope {
 pub struct ActiveBreakpoint {
     pub(crate) breakpoint_type: BreakpointType,
     pub(crate) address: u64,
+    pub(crate) condition: Option<String>,
+    pub(crate) hit_condition: Option<String>,
+    pub(crate) log_message: Option<String>,
+    pub(crate) hit_count: u64,
 }
 
 /// SessionData is designed to be similar to [probe_rs::Session], in as much that it provides handles to the [CoreHandle] instances for each of the available [probe_rs::Core] involved in the debug session.
@@ -341,22 +345,24 @@ impl SessionData {
         &mut self,
         core_index: usize,
     ) -> Result<CoreHandle<'_>, DebuggerError> {
-        if let (Ok(target_core), Some(core_data)) = (
-            self.session.core(core_index),
-            self.core_data
-                .iter_mut()
-                .find(|core_data| core_data.core_index == core_index),
-        ) {
-            Ok(CoreHandle {
-                core_id: core_index,
-                core: target_core,
-                core_data,
-            })
-        } else {
-            Err(DebuggerError::UnableToOpenProbe(Some(
-                "No core at the specified index.",
-            )))
-        }
+        let target_core = self.session.core(core_index).map_err(|e| {
+            tracing::warn!("Failed to get core {core_index}: {e:?}");
+            DebuggerError::ProbeRs(e)
+        })?;
+        let core_data = self
+            .core_data
+            .iter_mut()
+            .find(|core_data| core_data.core_index == core_index)
+            .ok_or_else(|| {
+                DebuggerError::UnableToOpenProbe(Some(
+                    "No core data at the specified index.",
+                ))
+            })?;
+        Ok(CoreHandle {
+            core_id: core_index,
+            core: target_core,
+            core_data,
+        })
     }
 
     /// The target has no way of notifying the debug adapter when things changes, so we have to constantly poll it to determine:
@@ -467,21 +473,24 @@ impl SessionData {
 
             // If the core is running, we set the flag to indicate that at least one core is not halted.
             // By setting it here, we ensure that RTT will be checked at least once after the core has halted.
+            // Attempt RTOS detection whenever the core is halted and not yet
+            // detected. This is done unconditionally (not gated on a
+            // running→halted transition) because attach_core may fail on
+            // early polls, consuming the only transition opportunity.
+            if current_core_status.is_halted()
+                && target_core.core_data.rtos.is_none()
+            {
+                if let Some(ref binary_path) = core_config.program_binary {
+                    target_core.core_data.rtos =
+                        try_detect_rtos(&mut target_core.core, binary_path);
+                }
+            }
+
             if !current_core_status.is_halted() {
                 debug_adapter.all_cores_halted = false;
             } else if !cores_halted_previously
                 && let Some(debug_info) = target_core.core_data.debug_info.as_ref()
             {
-                // Attempt RTOS detection on each running→halted transition until
-                // successful. The RTOS data structures may not be initialized on
-                // early halts (e.g. at Reset_Handler before chSysInit()).
-                if target_core.core_data.rtos.is_none() {
-                    if let Some(ref binary_path) = core_config.program_binary {
-                        target_core.core_data.rtos =
-                            try_detect_rtos(&mut target_core.core, binary_path);
-                    }
-                }
-
                 // If currently halted, and was previously running
                 // update the stack frames
                 let _stackframe_span = tracing::debug_span!("Update Stack Frames").entered();
