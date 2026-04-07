@@ -284,7 +284,7 @@ impl AddressIncrement {
         match value {
             0b00 => Some(AddressIncrement::Off),
             0b01 => Some(AddressIncrement::Single),
-            0b10 => Some(AddressIncrement::Packed),
+            0b10 | 0b11 => Some(AddressIncrement::Packed),
             _ => None,
         }
     }
