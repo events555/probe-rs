@@ -811,6 +811,9 @@ impl Debugger {
             supports_stepping_granularity: Some(true),
             supports_completions_request: Some(true),
             support_terminate_debuggee: Some(true),
+            supports_conditional_breakpoints: Some(true),
+            supports_hit_conditional_breakpoints: Some(true),
+            supports_log_points: Some(true),
             // supports_value_formatting_options: Some(true),
             // supports_function_breakpoints: Some(true),
             // TODO: Use DEMCR register to implement exception breakpoints

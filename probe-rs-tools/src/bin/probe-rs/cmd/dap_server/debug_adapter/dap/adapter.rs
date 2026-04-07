@@ -83,7 +83,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
             vscode_quirks: false,
             halt_after_reset: false,
             configuration_done: false,
-            all_cores_halted: true,
+            all_cores_halted: false,
             progress_id: 0,
             supports_progress_reporting: false,
             supports_ansi_styling: false,
@@ -842,7 +842,11 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
                 Some(bp.column.unwrap_or(0) as u64 + 1)
             };
 
-            let bp = match target_core.verify_and_set_breakpoint(
+            let condition = bp.condition.clone();
+            let hit_condition = bp.hit_condition.clone();
+            let log_message = bp.log_message.clone();
+
+            let dap_bp = match target_core.verify_and_set_breakpoint(
                 source_path.to_path(),
                 requested_breakpoint_line,
                 requested_breakpoint_column,
@@ -851,24 +855,36 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
                 Ok(VerifiedBreakpoint {
                     address,
                     source_location,
-                }) => Breakpoint {
-                    column: source_location.column.map(|col| match col {
-                        ColumnType::LeftEdge => 0_i64,
-                        ColumnType::Column(c) => c as i64,
-                    }),
-                    end_column: None,
-                    end_line: None,
-                    id: Some(address as i64),
-                    line: source_location.line.map(|line| line as i64),
-                    message: Some(format!(
-                        "Source breakpoint at memory address: {address:#010X}"
-                    )),
-                    source: Some(args.source.clone()),
-                    instruction_reference: Some(format!("{address:#010X}")),
-                    offset: None,
-                    verified: true,
-                    reason: None,
-                },
+                }) => {
+                    // Attach condition/hit/log metadata to the cached breakpoint.
+                    if let Some(active_bp) = target_core.core_data.breakpoints
+                        .iter_mut()
+                        .find(|b| b.address == address)
+                    {
+                        active_bp.condition = condition;
+                        active_bp.hit_condition = hit_condition;
+                        active_bp.log_message = log_message;
+                    }
+
+                    Breakpoint {
+                        column: source_location.column.map(|col| match col {
+                            ColumnType::LeftEdge => 0_i64,
+                            ColumnType::Column(c) => c as i64,
+                        }),
+                        end_column: None,
+                        end_line: None,
+                        id: Some(address as i64),
+                        line: source_location.line.map(|line| line as i64),
+                        message: Some(format!(
+                            "Source breakpoint at memory address: {address:#010X}"
+                        )),
+                        source: Some(args.source.clone()),
+                        instruction_reference: Some(format!("{address:#010X}")),
+                        offset: None,
+                        verified: true,
+                        reason: None,
+                    }
+                }
                 Err(error) => Breakpoint {
                     column: None,
                     end_column: None,
@@ -884,7 +900,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
                 },
             };
 
-            created_breakpoints.push(bp);
+            created_breakpoints.push(dap_bp);
         }
 
         let breakpoint_body = SetBreakpointsResponseBody {

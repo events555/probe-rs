@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use std::{ops::Range, path::Path};
 
 use super::session_data::{self, ActiveBreakpoint, BreakpointType, SourceLocationScope};
-use crate::cmd::dap_server::debug_adapter::dap::dap_types::{MessageSeverity, PromptKind};
+use crate::cmd::dap_server::debug_adapter::dap::dap_types::{self as dap_types, MessageSeverity, PromptKind};
 use crate::cmd::dap_server::debug_adapter::dap::repl_commands::ReplCommand;
 use crate::util::rtt::client::RttClient;
 use crate::util::rtt::{self, DataFormat, DefmtProcessor, DefmtState};
@@ -156,7 +156,18 @@ impl CoreHandle<'_> {
                 // is not handled or indicates that the core should halt.
             }
 
-            CoreStatus::Halted(_) => self.notify_halted(debug_adapter, status)?,
+            CoreStatus::Halted(_) => {
+                if !self.should_stop_at_breakpoint(debug_adapter)? {
+                    // Single-step past the breakpoint instruction before
+                    // resuming, otherwise the FPB comparator immediately
+                    // re-halts the core at the same address.
+                    self.core.step()?;
+                    self.core.run()?;
+                    self.core_data.last_known_status = CoreStatus::Running;
+                    return Ok(CoreStatus::Running);
+                }
+                self.notify_halted(debug_adapter, status)?
+            }
             CoreStatus::LockedUp => {
                 // TODO: We can't really continue here, but the debugger should remain working
                 //
@@ -347,6 +358,10 @@ impl CoreHandle<'_> {
             .push(session_data::ActiveBreakpoint {
                 breakpoint_type,
                 address,
+                condition: None,
+                hit_condition: None,
+                log_message: None,
+                hit_count: 0,
             });
         Ok(())
     }
@@ -688,6 +703,234 @@ impl CoreHandle<'_> {
         Ok(())
     }
 
+    /// Evaluate whether we should actually stop at the current breakpoint, based on
+    /// condition, hit_condition, and log_message fields. Returns true if we should
+    /// halt and notify the client, false if we should silently resume.
+    fn should_stop_at_breakpoint<P: ProtocolAdapter>(
+        &mut self,
+        debug_adapter: &mut DebugAdapter<P>,
+    ) -> Result<bool, DebuggerError> {
+        let reg_val: probe_rs::RegisterValue = self
+            .core
+            .read_core_reg(self.core.program_counter())
+            .map_err(DebuggerError::ProbeRs)?;
+        let pc: u64 = reg_val.try_into().map_err(DebuggerError::ProbeRs)?;
+
+        let bp = self
+            .core_data
+            .breakpoints
+            .iter_mut()
+            .find(|b| b.address == pc);
+
+        let Some(bp) = bp else {
+            tracing::debug!("No matching BP for PC {pc:#010x}");
+            return Ok(true);
+        };
+
+        bp.hit_count += 1;
+
+        // Copy fields out so we can release the mutable borrow on self.
+        let hit_count = bp.hit_count;
+        let hit_condition = bp.hit_condition.clone();
+        let condition = bp.condition.clone();
+        let log_message = bp.log_message.clone();
+
+        // Check hit condition first.
+        // DAP spec: hitCondition is a string like "5", ">10", "==3", "%2==0".
+        // We bind the current hit count and evaluate the expression.
+        if let Some(ref hit_cond) = hit_condition {
+            let mut context = evalexpr::HashMapContext::<evalexpr::DefaultNumericTypes>::new();
+            let _ = evalexpr::ContextWithMutableVariables::set_value(
+                &mut context,
+                "hit_count".into(),
+                evalexpr::Value::Int(hit_count as i64),
+            );
+
+            // If the expression starts with an operator, prepend hit_count.
+            // "5" → "hit_count == 5", ">3" → "hit_count >3", "%2==0" → "hit_count %2==0"
+            let expr = if hit_cond.starts_with(|c: char| c.is_ascii_digit()) {
+                format!("hit_count == {hit_cond}")
+            } else {
+                format!("hit_count {hit_cond}")
+            };
+            match evalexpr::eval_boolean_with_context(&expr, &context) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    tracing::warn!("Hit condition eval error for '{expr}': {e}");
+                }
+            }
+        }
+
+        // Evaluate condition expression using variable values from target.
+        if let Some(ref condition) = condition {
+            // Parse the expression once — we use the operator tree both to
+            // discover which variables need to be resolved from the target
+            // and to evaluate the final result.
+            match evalexpr::build_operator_tree::<evalexpr::DefaultNumericTypes>(condition) {
+                Ok(tree) => {
+                    let mut context = evalexpr::HashMapContext::new();
+                    for ident in tree.iter_variable_identifiers() {
+                        match self.resolve_variable_value(ident) {
+                            Some(val) => {
+                                tracing::debug!("Condition var '{ident}' = {val:?}");
+                                let _ = evalexpr::ContextWithMutableVariables::set_value(
+                                    &mut context,
+                                    ident.to_string().into(),
+                                    val,
+                                );
+                            }
+                            None => {
+                                tracing::warn!("Condition var '{ident}' not found");
+                            }
+                        }
+                    }
+
+                    // Evaluate and coerce to bool with C-like truthiness:
+                    // false / 0 / 0.0 / "" → don't stop; anything else → stop.
+                    match tree.eval_with_context(&context) {
+                        Ok(val) => {
+                            let is_truthy = match &val {
+                                evalexpr::Value::Boolean(b) => *b,
+                                evalexpr::Value::Int(i) => *i != 0,
+                                evalexpr::Value::Float(f) => *f != 0.0,
+                                evalexpr::Value::String(s) => !s.is_empty(),
+                                _ => true,
+                            };
+                            if !is_truthy {
+                                return Ok(false);
+                            }
+                            tracing::debug!("Condition '{condition}' => {val:?} (truthy)");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Condition eval error for '{condition}': {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse condition '{condition}': {e}");
+                }
+            }
+        }
+
+        // Log message: emit output event and resume instead of stopping.
+        if let Some(ref log_msg) = log_message {
+            let mut output = log_msg.clone();
+
+            while let Some(start) = output.find('{') {
+                if let Some(end) = output[start..].find('}') {
+                    let var_name = &output[start + 1..start + end];
+                    let replacement = self
+                        .resolve_variable_display(var_name)
+                        .unwrap_or_else(|| format!("<{var_name}?>"));
+                    output = format!(
+                        "{}{}{}",
+                        &output[..start],
+                        replacement,
+                        &output[start + end + 1..]
+                    );
+                } else {
+                    break;
+                }
+            }
+
+            let event_body = Some(dap_types::OutputEventBody {
+                category: Some("console".to_string()),
+                output: format!("{output}\n"),
+                column: None,
+                data: None,
+                group: None,
+                line: None,
+                location_reference: None,
+                source: None,
+                variables_reference: None,
+            });
+            debug_adapter.send_event("output", event_body)?;
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// Look up a variable by name in locals (current frame) then statics.
+    fn resolve_variable(&self, name: &str) -> Option<(probe_rs_debug::Variable, &VariableCache)> {
+        let var_name = probe_rs_debug::VariableName::Named(name.to_string());
+
+        if let Some(cache) = self
+            .core_data
+            .stack_frames
+            .first()
+            .and_then(|f| f.local_variables.as_ref())
+        {
+            if let Some(var) = cache.get_variable_by_name(&var_name) {
+                return Some((var, cache));
+            }
+        }
+
+        if let Some(cache) = self.core_data.static_variables.as_ref() {
+            if let Some(var) = cache.get_variable_by_name(&var_name) {
+                return Some((var, cache));
+            }
+        }
+
+        None
+    }
+
+    /// Read a variable's current value directly from target memory.
+    fn resolve_variable_value(&mut self, name: &str) -> Option<evalexpr::Value> {
+        let (var, _) = self.resolve_variable(name)?;
+        let address = var.memory_location.memory_address().ok()?;
+        let byte_size = var.byte_size? as usize;
+        let type_name = var.type_name.clone();
+
+        let mut buf = [0u8; 8];
+        let read_size = byte_size.min(8);
+        self.core.read(address, &mut buf[..read_size]).ok()?;
+
+        Self::raw_to_evalexpr(&type_name, byte_size, &buf)
+    }
+
+    fn raw_to_evalexpr(
+        type_name: &probe_rs_debug::variable::VariableType,
+        byte_size: usize,
+        buf: &[u8; 8],
+    ) -> Option<evalexpr::Value> {
+        use probe_rs_debug::variable::VariableType;
+
+        // Unwrap typedefs/modifiers to get to the base type.
+        match type_name {
+            VariableType::Modified(_, inner) => Self::raw_to_evalexpr(inner, byte_size, buf),
+            VariableType::Base(name) => match (name.as_str(), byte_size) {
+                ("bool" | "_Bool", _) => Some(evalexpr::Value::Boolean(buf[0] != 0)),
+                ("float" | "f32", 4) => {
+                    let v = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    Some(evalexpr::Value::Float(v as f64))
+                }
+                ("double" | "f64", 8) => {
+                    let v = f64::from_le_bytes(*buf);
+                    Some(evalexpr::Value::Float(v))
+                }
+                (_, 1) => Some(evalexpr::Value::Int(buf[0] as i64)),
+                (_, 2) => Some(evalexpr::Value::Int(i16::from_le_bytes([buf[0], buf[1]]) as i64)),
+                (_, 4) => Some(evalexpr::Value::Int(i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64)),
+                (_, 8) => Some(evalexpr::Value::Int(i64::from_le_bytes(*buf))),
+                _ => None,
+            },
+            VariableType::Enum(_) => match byte_size {
+                1 => Some(evalexpr::Value::Int(buf[0] as i64)),
+                2 => Some(evalexpr::Value::Int(i16::from_le_bytes([buf[0], buf[1]]) as i64)),
+                4 => Some(evalexpr::Value::Int(i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Read a variable's current value from target memory as a display string.
+    fn resolve_variable_display(&mut self, name: &str) -> Option<String> {
+        self.resolve_variable_value(name).map(|v| v.to_string())
+    }
+
     /// Reads memory from the target.
     ///
     /// Returns a vector containing as many bytes as possible to read, stopping at the first error.
@@ -736,8 +979,21 @@ impl CoreHandle<'_> {
     }
 
     /// Writes memory of the target core.
+    ///
+    /// ARM PPB (Private Peripheral Bus, 0xE000_0000..0xE00F_FFFF) registers
+    /// require word-aligned, word-sized writes.  Byte-width SWD transactions
+    /// to this region are silently dropped or corrupted on many probes.
     pub(crate) fn write_memory(&mut self, address: u64, data_bytes: &[u8]) -> Result<(), Error> {
-        self.core.write_8(address, data_bytes)
+        let is_ppb = (0xE000_0000..=0xE00F_FFFF).contains(&address);
+        if is_ppb && data_bytes.len() % 4 == 0 && address % 4 == 0 {
+            let words: Vec<u32> = data_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            self.core.write_32(address, &words)
+        } else {
+            self.core.write_8(address, data_bytes)
+        }
     }
 
     pub(crate) fn reapply_breakpoints(&mut self) {

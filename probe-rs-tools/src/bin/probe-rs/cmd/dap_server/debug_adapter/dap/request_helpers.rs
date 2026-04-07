@@ -528,8 +528,18 @@ pub(crate) fn set_instruction_breakpoint(
         .as_str()
         .try_into()
     {
+        let condition = requested_breakpoint.condition.clone();
+        let hit_condition = requested_breakpoint.hit_condition.clone();
         match target_core.set_breakpoint(memory_reference, BreakpointType::InstructionBreakpoint) {
             Ok(_) => {
+                // Attach condition metadata to the cached breakpoint.
+                if let Some(active_bp) = target_core.core_data.breakpoints
+                    .iter_mut()
+                    .find(|b| b.address == memory_reference)
+                {
+                    active_bp.condition = condition;
+                    active_bp.hit_condition = hit_condition;
+                }
                 breakpoint_response.verified = true;
                 breakpoint_response.instruction_reference =
                     Some(format!("{memory_reference:#010x}"));
