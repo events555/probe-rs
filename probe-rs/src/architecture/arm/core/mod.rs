@@ -137,6 +137,11 @@ pub struct CortexMState {
 
     hw_breakpoints_enabled: bool,
 
+    /// FPB has had a comparator written since the last enable cycle and needs
+    /// an off→on toggle for the new value to arm. Observed on STM32G4 via BMP:
+    /// a freshly-written comparator only takes effect after the FPB is toggled.
+    fpb_needs_rearm: bool,
+
     current_state: CoreStatus,
 
     fp_present: bool,
@@ -150,6 +155,7 @@ impl CortexMState {
         Self {
             initialized: false,
             hw_breakpoints_enabled: false,
+            fpb_needs_rearm: false,
             current_state: CoreStatus::Unknown,
             fp_present: false,
             semihosting_command: None,

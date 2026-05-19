@@ -790,6 +790,22 @@ impl CoreInterface for Armv7m<'_> {
             self.step()?;
         }
 
+        // Apply any deferred FPB rearm from set_hw_breakpoint before resuming.
+        if self.state.fpb_needs_rearm && self.state.hw_breakpoints_enabled {
+            let fp_ctrl_addr = FpCtrl::get_mmio_address();
+            let mut disable = FpCtrl::from(0);
+            disable.set_key(true);
+            disable.set_enable(false);
+            self.memory.write_word_32(fp_ctrl_addr, disable.into())?;
+
+            let mut enable = FpCtrl::from(0);
+            enable.set_key(true);
+            enable.set_enable(true);
+            self.memory.write_word_32(fp_ctrl_addr, enable.into())?;
+
+            self.state.fpb_needs_rearm = false;
+        }
+
         let mut dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
 
         // First disable the DHCSR->C_MASKINTS.
@@ -823,6 +839,7 @@ impl CoreInterface for Armv7m<'_> {
         // Invalidate cached state: chip reset clears FP_CTRL and core status
         self.set_core_status(CoreStatus::Unknown);
         self.state.hw_breakpoints_enabled = false;
+        self.state.fpb_needs_rearm = false;
         Ok(())
     }
 
@@ -837,6 +854,7 @@ impl CoreInterface for Armv7m<'_> {
         // Invalidate cached state: chip reset clears FP_CTRL and core status
         self.set_core_status(CoreStatus::Unknown);
         self.state.hw_breakpoints_enabled = false;
+        self.state.fpb_needs_rearm = false;
 
         // Some processors may not enter the halt state immediately after clearing the reset state.
         // Particularly: on PSOC 6, vector catch takes effect after the core's boot ROM finishes
@@ -1026,6 +1044,10 @@ impl CoreInterface for Armv7m<'_> {
         self.memory.flush()?;
 
         self.state.hw_breakpoints_enabled = state;
+        // An explicit FpCtrl write supersedes any pending deferred rearm:
+        // either we just disabled the FPB, or we just performed an enable
+        // transition that arms any newly-written comparators.
+        self.state.fpb_needs_rearm = false;
 
         Ok(())
     }
@@ -1069,27 +1091,10 @@ impl CoreInterface for Armv7m<'_> {
         // address spaces than Rev1.
         let reg_addr = FpRev1CompX::get_mmio_address() + (bp_unit_index * size_of::<u32>()) as u64;
 
-        // Write the comparator, then cycle FPB off→on.  On some targets
-        // (e.g. STM32G4 via BMP) a newly-written comparator does not take
-        // effect until the FPB unit is toggled.  The readbacks between
-        // writes ensure each SWD transaction completes before the next.
         self.memory.write_word_32(reg_addr, val)?;
-        self.memory.flush()?;
-        let _ = self.memory.read_word_32(reg_addr)?; // ensure comparator write landed
-
-        let fp_ctrl_addr = FpCtrl::get_mmio_address();
-        let mut disable = FpCtrl::from(0);
-        disable.set_key(true);
-        disable.set_enable(false);
-        self.memory.write_word_32(fp_ctrl_addr, disable.into())?;
-        self.memory.flush()?;
-        let _ = self.memory.read_word_32(fp_ctrl_addr)?; // ensure disable landed
-
-        let mut enable = FpCtrl::from(0);
-        enable.set_key(true);
-        enable.set_enable(true);
-        self.memory.write_word_32(fp_ctrl_addr, enable.into())?;
-        self.memory.flush()?;
+        // Defer the FPB off→on cycle (see CortexMState::fpb_needs_rearm) so
+        // batch breakpoint sets pay for one toggle rather than one per call.
+        self.state.fpb_needs_rearm = true;
 
         Ok(())
     }
