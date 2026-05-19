@@ -202,15 +202,16 @@ impl Session {
 
         // Use ARM DAP path when the target connects via SWD/DAP: either ARM cores or RISC-V cores
         // over mem-AP (e.g. RP235x_riscv).
-        let mut session = if target.default_core().memory_ap().is_some() {
+        let session = if target.default_core().memory_ap().is_some() {
             Self::attach_arm_debug_interface(probe, target, attach_method, permissions, cores)?
         } else {
             Self::attach_jtag(probe, target, attach_method, permissions, cores)?
         };
 
-        if let Err(err) = session.clear_all_hw_breakpoints() {
-            tracing::warn!("Could not clear stale hardware breakpoints on attach: {:?}", anyhow::anyhow!(err));
-        }
+        // Stale breakpoints are cleared by Session::drop on the previous
+        // session's exit; clearing again here forces a halt/resume on attach
+        // that can time out on probes with high per-op latency (e.g. BMP) or
+        // on targets that are in deep sleep when we connect.
 
         Ok(session)
     }
