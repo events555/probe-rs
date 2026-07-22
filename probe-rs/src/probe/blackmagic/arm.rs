@@ -718,7 +718,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
         // and some peripherals (e.g. DBGMCU) only support word-sized access.
         let csw = (self.csw & !0x7) | (align as u32);
         let command = match self.current_ap.ap_address().ap() {
-            ApAddress::V1(_) => match self.probe.probe.remote_protocol {
+            ApAddress::V1(apsel) => match self.probe.probe.remote_protocol {
                 ProtocolVersion::V0 => {
                     return Err(ArmError::Probe(
                         DebugProbeError::CommandNotSupportedByProbe {
@@ -727,7 +727,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                     ));
                 }
                 ProtocolVersion::V0P => RemoteCommand::MemReadV0P {
-                    apsel: 0,
+                    apsel: *apsel,
                     csw,
                     offset: offset
                         .try_into()
@@ -736,7 +736,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 },
                 ProtocolVersion::V1 | ProtocolVersion::V2 => RemoteCommand::MemReadV1 {
                     index: self.index,
-                    apsel: 0,
+                    apsel: *apsel,
                     csw,
                     offset: offset
                         .try_into()
@@ -745,7 +745,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 },
                 ProtocolVersion::V3 => RemoteCommand::MemReadV3 {
                     index: self.index,
-                    apsel: 0,
+                    apsel: *apsel,
                     csw,
                     offset: offset
                         .try_into()
@@ -754,7 +754,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 },
                 ProtocolVersion::V4 => RemoteCommand::MemReadV4 {
                     index: self.index,
-                    apsel: 0,
+                    apsel: *apsel,
                     csw,
                     offset,
                     data,
@@ -804,7 +804,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
         // Update the CSW Size field to match the actual access width, same as read path.
         let csw = (self.csw & !0x7) | (align as u32);
         let command = match self.current_ap.ap_address().ap() {
-            ApAddress::V1(_) => match self.probe.probe.remote_protocol {
+            ApAddress::V1(apsel) => match self.probe.probe.remote_protocol {
                 ProtocolVersion::V0 => {
                     return Err(ArmError::Probe(
                         DebugProbeError::CommandNotSupportedByProbe {
@@ -813,7 +813,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                     ));
                 }
                 ProtocolVersion::V0P => RemoteCommand::MemWriteV0P {
-                    apsel: 0,
+                    apsel: *apsel,
                     csw,
                     align,
                     offset: offset
@@ -823,7 +823,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 },
                 ProtocolVersion::V1 | ProtocolVersion::V2 => RemoteCommand::MemWriteV1 {
                     index: self.index,
-                    apsel: 0,
+                    apsel: *apsel,
                     csw,
                     align,
                     offset: offset
@@ -833,7 +833,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 },
                 ProtocolVersion::V3 => RemoteCommand::MemWriteV3 {
                     index: self.index,
-                    apsel: 0,
+                    apsel: *apsel,
                     csw,
                     align,
                     offset: offset
@@ -843,7 +843,7 @@ impl BlackMagicProbeMemoryInterface<'_> {
                 },
                 ProtocolVersion::V4 => RemoteCommand::MemWriteV4 {
                     index: self.index,
-                    apsel: 0,
+                    apsel: *apsel,
                     csw,
                     align,
                     offset,
